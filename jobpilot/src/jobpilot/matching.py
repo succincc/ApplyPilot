@@ -125,8 +125,11 @@ def evaluate(job: Job, prefs: Preferences) -> tuple[int, list[str], bool]:
             elif in_desc:
                 hits += 1.0
                 matched.append(k)
-        # Normalize against the best case (every keyword in the title).
-        kw_score = min(1.0, hits / (2.0 * len(kw))) * 55
+        # Saturate at 4 points (= two title hits): keyword lists are OR-style
+        # variants of the same intent, so matching a couple strongly is a full
+        # signal. Normalizing by len(keywords) would punish rich configs —
+        # no posting contains every variant.
+        kw_score = min(1.0, hits / min(4.0, 2.0 * len(kw))) * 55
         score += kw_score
         reasons.append(f"keywords {kw_score:.0f}/55 — matched: {', '.join(matched) or 'none'}")
     else:

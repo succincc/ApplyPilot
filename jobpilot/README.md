@@ -51,9 +51,15 @@ Python 3.10+.
 
 ## Quick start
 
+**Windows:** double-click `setup.bat` once, edit the three YAML files it
+creates, then double-click `run.bat` whenever you want to apply.
+
+**Any OS:**
+
 ```bash
 jobpilot init        # writes config.yaml, profile.yaml, answers.yaml here
 #   -> edit those three files (details below)
+jobpilot doctor      # preflight: config, profile, resume, browser, network
 jobpilot run         # discover + match
 jobpilot review      # see what's queued and what needs your input
 jobpilot apply       # open the browser and fill applications

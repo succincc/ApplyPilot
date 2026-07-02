@@ -185,6 +185,17 @@ def status() -> None:
 
 
 @app.command()
+def doctor(
+    skip_network: bool = typer.Option(False, help="Skip connectivity probes."),
+    skip_browser: bool = typer.Option(False, help="Skip the browser launch check."),
+) -> None:
+    """Preflight: verify config, profile, resume, browser, and network."""
+    from jobpilot.doctor import run_doctor
+    raise SystemExit(1 if run_doctor(skip_network=skip_network,
+                                     skip_browser=skip_browser) else 0)
+
+
+@app.command()
 def version() -> None:
     """Print the JobPilot version."""
     console.print(f"JobPilot {__version__}")

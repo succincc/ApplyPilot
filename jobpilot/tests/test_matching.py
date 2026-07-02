@@ -101,3 +101,20 @@ def test_malformed_posting_rejected():
     assert not passed
     job2 = Job(source="x", company="Acme", title="Python Dev", url="  ")
     assert evaluate(job2, prefs())[2] is False
+
+
+def test_many_keyword_variants_do_not_dilute_score():
+    # 9 OR-style keyword variants; a job matching two in the title must still
+    # be able to clear the queue threshold.
+    p = prefs(keywords=["operations manager", "business operations",
+                        "operations coordinator", "marketing operations",
+                        "digital marketing manager", "growth marketing",
+                        "marketing analyst", "revenue operations",
+                        "campaign manager"])
+    job = Job(source="x", company="GrowthCo", title="Marketing Operations Manager",
+              url="http://x", location="Remote", remote=True,
+              description="Own campaign operations and KPI reporting.",
+              employment_type="full_time", salary_min=70000, salary_max=90000)
+    score, reasons, passed = evaluate(job, p)
+    assert passed
+    assert score >= p.min_score, reasons
