@@ -59,8 +59,16 @@ def _find_file(name: str, example: str) -> Path:
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8") as fh:
-        return yaml.safe_load(fh) or {}
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh)
+    except yaml.YAMLError as exc:
+        raise SystemExit(f"Invalid YAML in {path}:\n  {exc}") from exc
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise SystemExit(f"{path} must be a YAML mapping (key: value), got {type(data).__name__}")
+    return data
 
 
 def load_raw_config() -> dict[str, Any]:

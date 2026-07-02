@@ -15,6 +15,10 @@ _SALARY = re.compile(
     re.IGNORECASE,
 )
 
+# Retirement plans ("401k", "401(k)", "403(b)") would otherwise parse as
+# $401,000 salaries; strip them before matching.
+_RETIREMENT = re.compile(r"\b40[13]\s*\(?\s*[kb]\s*\)?\b", re.IGNORECASE)
+
 
 def client(timeout: float = 30.0) -> httpx.Client:
     """An httpx client that honors HTTPS_PROXY / HTTP_PROXY from the env."""
@@ -34,6 +38,7 @@ def parse_salary(text: str) -> tuple[Optional[int], Optional[int]]:
     """
     if not text:
         return None, None
+    text = _RETIREMENT.sub(" ", text)
     values: list[int] = []
     for m in _SALARY.finditer(text):
         raw = m.group(1).replace(",", "").replace(".", "")

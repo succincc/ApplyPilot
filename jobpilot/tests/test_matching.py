@@ -79,3 +79,25 @@ def test_no_salary_kept_when_allowed():
               location="Remote", remote=True, employment_type="full_time")
     score, reasons, passed = evaluate(job, prefs())
     assert passed
+
+
+def test_future_posted_date_cannot_inflate_recency():
+    from datetime import datetime, timedelta, timezone
+    future = (datetime.now(timezone.utc) + timedelta(days=90)).isoformat()
+    fresh = datetime.now(timezone.utc).isoformat()
+    base = dict(source="x", company="Acme", title="Python Backend Engineer",
+                url="http://x", location="Remote", remote=True,
+                description="python backend", employment_type="full_time",
+                salary_max=140000)
+    future_job = Job(**base, posted_at=future)
+    fresh_job = Job(**base, posted_at=fresh)
+    p = prefs()
+    assert evaluate(future_job, p)[0] == evaluate(fresh_job, p)[0]
+
+
+def test_malformed_posting_rejected():
+    job = Job(source="x", company="", title="", url="http://x")
+    score, reasons, passed = evaluate(job, prefs())
+    assert not passed
+    job2 = Job(source="x", company="Acme", title="Python Dev", url="  ")
+    assert evaluate(job2, prefs())[2] is False

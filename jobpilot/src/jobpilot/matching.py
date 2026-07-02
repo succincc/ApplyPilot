@@ -38,7 +38,9 @@ def _parse_age_days(posted_at: Optional[str]) -> Optional[int]:
         dt = datetime.fromisoformat(posted_at.replace("Z", "+00:00"))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return (datetime.now(timezone.utc) - dt).days
+        # Clock skew / bad source data can yield future dates; clamp to 0 so
+        # recency scoring can't exceed its cap.
+        return max(0, (datetime.now(timezone.utc) - dt).days)
     except (ValueError, TypeError):
         return None
 
@@ -81,6 +83,9 @@ def evaluate(job: Job, prefs: Preferences) -> tuple[int, list[str], bool]:
     hay = f"{job.title}\n{job.description}"
 
     # ---- Hard filters ------------------------------------------------------
+    if not job.title.strip() or not job.url.strip():
+        return 0, ["malformed posting: missing title or URL"], False
+
     excl = _contains_any(hay, prefs.exclude_keywords)
     if excl:
         return 0, [f"excluded by keyword '{excl}'"], False

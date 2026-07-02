@@ -22,3 +22,12 @@ def test_guess_remote():
     assert guess_remote("Remote - US") is True
     assert guess_remote("New York, NY") is False
     assert guess_remote("", "You can work from home") is True
+
+
+def test_parse_salary_ignores_retirement_plans():
+    assert parse_salary("Benefits include a 401k plan") == (None, None)
+    assert parse_salary("401(k) matching and health insurance") == (None, None)
+    assert parse_salary("403(b) available") == (None, None)
+    # Real salary next to a 401k mention still parses.
+    lo, hi = parse_salary("Salary $95,000 - $120,000 plus 401k")
+    assert (lo, hi) == (95000, 120000)

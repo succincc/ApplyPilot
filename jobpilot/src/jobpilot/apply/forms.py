@@ -41,35 +41,43 @@ _LABEL_JS = """
 }
 """
 
-# (needles, profile lookup) — first matching needle in the label wins.
-_DIRECT_FIELDS: list[tuple[list[str], list[str]]] = [
-    (["first name", "given name"], ["personal", "first_name"]),
-    (["last name", "family name", "surname"], ["personal", "last_name"]),
-    (["full name", "your name", "name"], ["personal", "full_name"]),
-    (["email"], ["personal", "email"]),
-    (["phone", "mobile", "telephone"], ["personal", "phone"]),
-    (["address", "street"], ["personal", "address_line1"]),
-    (["city", "town"], ["personal", "city"]),
-    (["state", "province", "region"], ["personal", "state"]),
-    (["zip", "postal"], ["personal", "postal_code"]),
-    (["country"], ["personal", "country"]),
-    (["linkedin"], ["links", "linkedin"]),
-    (["github"], ["links", "github"]),
-    (["portfolio", "personal website", "website"], ["links", "portfolio"]),
-    (["current company", "employer"], ["experience", "current_company"]),
-    (["current title", "job title", "current role"], ["experience", "current_title"]),
+# (needles, profile lookup, blockers) — first matching needle in the label
+# wins, unless a blocker substring is also present. Blockers stop greedy
+# needles like "name" from claiming "Company Name" or "School Name"; blocked
+# labels fall through to the answer engine, which flags them for review
+# rather than filling wrong data.
+_NAME_BLOCKERS = ["company", "employer", "school", "university", "referr",
+                  "manager", "recruiter", "agency", "middle"]
+
+_DIRECT_FIELDS: list[tuple[list[str], list[str], list[str]]] = [
+    (["first name", "given name"], ["personal", "first_name"], []),
+    (["last name", "family name", "surname"], ["personal", "last_name"], []),
+    (["current company", "employer"], ["experience", "current_company"], []),
+    (["current title", "job title", "current role"], ["experience", "current_title"], []),
+    (["full name", "your name", "name"], ["personal", "full_name"], _NAME_BLOCKERS),
+    (["email"], ["personal", "email"], []),
+    (["phone", "mobile", "telephone"], ["personal", "phone"], []),
+    (["address", "street"], ["personal", "address_line1"], ["email"]),
+    (["city", "town"], ["personal", "city"], []),
+    (["state", "province", "region"], ["personal", "state"], ["estate", "statement"]),
+    (["zip", "postal"], ["personal", "postal_code"], []),
+    (["country"], ["personal", "country"], []),
+    (["linkedin"], ["links", "linkedin"], []),
+    (["github"], ["links", "github"], []),
+    (["portfolio", "personal website", "website"], ["links", "portfolio"], []),
 ]
 
 # EEO / authorization selects handled as choices.
-_CHOICE_FIELDS: list[tuple[list[str], list[str]]] = [
+_CHOICE_FIELDS: list[tuple[list[str], list[str], list[str]]] = [
     (["authorized to work", "legally authorized", "work authorization"],
-     ["work_authorization", "authorized_to_work"]),
-    (["sponsorship", "require sponsor", "visa"], ["work_authorization", "requires_sponsorship"]),
-    (["gender"], ["eeo", "gender"]),
-    (["race", "ethnicity"], ["eeo", "race_ethnicity"]),
-    (["veteran"], ["eeo", "veteran_status"]),
-    (["disability"], ["eeo", "disability_status"]),
-    (["hispanic", "latino"], ["eeo", "hispanic_latino"]),
+     ["work_authorization", "authorized_to_work"], []),
+    (["sponsorship", "require sponsor", "visa"],
+     ["work_authorization", "requires_sponsorship"], []),
+    (["gender"], ["eeo", "gender"], []),
+    (["race", "ethnicity"], ["eeo", "race_ethnicity"], []),
+    (["veteran"], ["eeo", "veteran_status"], []),
+    (["disability"], ["eeo", "disability_status"], []),
+    (["hispanic", "latino"], ["eeo", "hispanic_latino"], []),
 ]
 
 
@@ -96,7 +104,9 @@ def _dig(profile: dict[str, Any], path: list[str]) -> str:
 
 def _first_needle(label: str, table) -> list[str] | None:
     low = label.lower()
-    for needles, path in table:
+    for needles, path, blockers in table:
+        if any(b in low for b in blockers):
+            continue
         if any(n in low for n in needles):
             return path
     return None
