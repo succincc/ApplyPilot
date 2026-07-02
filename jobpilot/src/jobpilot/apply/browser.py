@@ -11,12 +11,17 @@ you can take over for CAPTCHAs and logins.
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import contextmanager
 from typing import Iterator
 
 from jobpilot.config import BROWSER_PROFILE_DIR, ensure_dirs
 
 log = logging.getLogger(__name__)
+
+# Point this at an existing Chromium/Chrome binary to skip
+# `playwright install chromium` (e.g. a system Chrome install).
+_EXECUTABLE_ENV = "JOBPILOT_BROWSER_EXECUTABLE"
 
 
 @contextmanager
@@ -36,14 +41,18 @@ def browser_page(headless: bool = False, slow_mo_ms: int = 50) -> Iterator["Page
         ) from exc
 
     ensure_dirs()
+    launch_kwargs: dict = {
+        "user_data_dir": str(BROWSER_PROFILE_DIR),
+        "headless": headless,
+        "slow_mo": slow_mo_ms,
+        "viewport": {"width": 1280, "height": 900},
+        "args": ["--disable-blink-features=AutomationControlled"],
+    }
+    executable = os.environ.get(_EXECUTABLE_ENV)
+    if executable:
+        launch_kwargs["executable_path"] = executable
     with sync_playwright() as pw:
-        context = pw.chromium.launch_persistent_context(
-            user_data_dir=str(BROWSER_PROFILE_DIR),
-            headless=headless,
-            slow_mo=slow_mo_ms,
-            viewport={"width": 1280, "height": 900},
-            args=["--disable-blink-features=AutomationControlled"],
-        )
+        context = pw.chromium.launch_persistent_context(**launch_kwargs)
         page = context.pages[0] if context.pages else context.new_page()
         page.set_default_timeout(20_000)
         try:
