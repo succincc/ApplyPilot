@@ -1,0 +1,114 @@
+# JobPilot preferences — copy to config.yaml and edit.
+# These are the "preset options" that drive discovery and matching.
+# The bot adjusts its behavior per platform automatically.
+
+search:
+  # Job titles / keywords you're targeting. Used for both discovery queries
+  # and rule-based matching. Order doesn't matter.
+  keywords:
+    - "software engineer"
+    - "backend developer"
+    - "python developer"
+
+  # Titles/keywords that, if present, disqualify a job (case-insensitive).
+  exclude_keywords:
+    - "senior staff"
+    - "principal"
+    - "clearance required"
+
+location:
+  # Free-text locations you'll accept. "Remote" is matched specially.
+  preferred:
+    - "Remote"
+    - "New York, NY"
+    - "Austin, TX"
+
+  # Anchor point for radius filtering (optional). If set together with
+  # radius_miles and a geocoder is configured, jobs are filtered by distance.
+  anchor: "New York, NY"
+
+  # How many miles from `anchor` a job may be. 0 disables radius filtering
+  # and falls back to matching the `preferred` list textually.
+  radius_miles: 50
+
+  # Accept fully-remote jobs regardless of location.
+  allow_remote: true
+
+  # Accept jobs that don't state a location.
+  allow_unspecified: true
+
+compensation:
+  # Minimum acceptable annual salary (in `currency`). Jobs whose stated
+  # maximum is below this are filtered out. Jobs with no stated salary are
+  # kept unless drop_if_no_salary is true.
+  min_salary: 90000
+  # Ceiling used only for scoring/ranking, never to reject a job.
+  target_salary: 130000
+  currency: "USD"
+  drop_if_no_salary: false
+
+filters:
+  # Employment types to accept: full_time, part_time, contract, internship.
+  employment_types:
+    - full_time
+    - contract
+  # Only consider jobs posted within this many days (0 = no limit).
+  max_age_days: 30
+
+matching:
+  # A job must score at least this (0-100) to enter the apply queue.
+  min_score: 55
+  # Jobs at or above this score are auto-approved for submission when
+  # auto_submit is enabled; below it they wait for manual review.
+  auto_approve_score: 75
+
+apply:
+  # SAFETY DEFAULT: false means the bot fills every field and stops at the
+  # final Submit button so you can eyeball it and click Submit yourself.
+  # Set true only once you trust it — it will click Submit automatically for
+  # jobs at/above auto_approve_score.
+  auto_submit: false
+
+  # Run the browser visibly (recommended) so you can solve CAPTCHAs/logins
+  # when the bot pauses for them. Headless disables human-in-the-loop rescue.
+  headless: false
+
+  # Max applications per run. Guardrail against runaway automation.
+  max_per_run: 25
+
+  # Seconds to pause between applications (be a good citizen; avoid rate
+  # limits and bans). Randomized +/-30% at runtime.
+  delay_between_seconds: 20
+
+  # How long to wait (seconds) for you to solve a CAPTCHA / finish a login
+  # before giving up on a job and moving on.
+  human_solve_timeout: 180
+
+discovery:
+  # Which discovery sources to poll. Each is a public, documented API or feed
+  # — no scraping, no ToS violations, no account bans.
+  sources:
+    remotive:
+      enabled: true
+
+    usajobs:
+      enabled: false
+      # Get a free key at https://developer.usajobs.gov/
+      email: ""
+      api_key: ""
+
+    # Greenhouse public job boards. Add the board tokens of companies you want
+    # to apply to (the slug in boards.greenhouse.io/<token>).
+    greenhouse:
+      enabled: true
+      companies:
+        - "stripe"
+        - "airbnb"
+        - "figma"
+
+    # Lever public postings. Add company slugs (jobs.lever.co/<slug>).
+    lever:
+      enabled: true
+      companies:
+        - "netflix"
+        - "plaid"

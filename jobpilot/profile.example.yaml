@@ -1,0 +1,46 @@
+# JobPilot profile — copy to profile.yaml and edit.
+# This is the data used to auto-fill application forms. No AI touches it.
+
+personal:
+  first_name: "Jane"
+  last_name: "Doe"
+  full_name: "Jane Doe"
+  email: "jane.doe@example.com"
+  phone: "+1 555 123 4567"
+  address_line1: "123 Main St"
+  city: "New York"
+  state: "NY"
+  postal_code: "10001"
+  country: "United States"
+
+links:
+  linkedin: "https://www.linkedin.com/in/janedoe"
+  github: "https://github.com/janedoe"
+  portfolio: "https://janedoe.dev"
+  website: ""
+
+work_authorization:
+  # "Yes" / "No" strings match most dropdowns directly.
+  authorized_to_work: "Yes"
+  requires_sponsorship: "No"
+
+documents:
+  # Absolute paths on your machine. On Windows use forward slashes or double
+  # backslashes, e.g. C:/Users/Jane/Documents/resume.pdf
+  resume: "C:/Users/Jane/Documents/resume.pdf"
+  cover_letter: ""   # optional; a template can generate one per job (no AI)
+
+experience:
+  current_title: "Software Engineer"
+  current_company: "Acme Corp"
+  years_experience: 4
+  education_level: "Bachelor's Degree"
+  desired_title: "Software Engineer"
+
+# Voluntary EEO answers. Every field defaults to declining; edit if you wish.
+eeo:
+  gender: "Decline to self-identify"
+  race_ethnicity: "Decline to self-identify"
+  veteran_status: "I am not a protected veteran"
+  disability_status: "I do not wish to answer"
+  hispanic_latino: "Decline to self-identify"

@@ -1,0 +1,22 @@
+# Local user data — never commit real personal info or credentials
+config.yaml
+profile.yaml
+answers.yaml
+*.local.yaml
+
+# JobPilot working data
+.jobpilot/
+jobpilot.db
+browser-profile/
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/

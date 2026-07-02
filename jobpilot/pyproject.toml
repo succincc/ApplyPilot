@@ -1,0 +1,45 @@
+[project]
+name = "jobpilot"
+version = "0.1.0"
+description = "A no-AI, config-driven job application bot. Discovers jobs from public ATS/board APIs, matches them to your preferences, and fills external application forms with human-in-the-loop safety."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "JobPilot contributors" }]
+keywords = ["job-search", "automation", "applications", "ats", "greenhouse", "lever"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business",
+]
+
+dependencies = [
+    "httpx>=0.24",
+    "pyyaml>=6.0",
+    "rich>=13.0",
+    "typer>=0.9",
+    "playwright>=1.40",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "ruff>=0.1"]
+
+[project.scripts]
+jobpilot = "jobpilot.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/jobpilot"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100

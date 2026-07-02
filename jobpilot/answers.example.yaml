@@ -1,0 +1,74 @@
+# JobPilot answer bank — copy to answers.yaml and edit.
+#
+# How it works (NO AI, fully deterministic):
+#  - Each rule has `match_any`: a list of lowercase substrings. If the
+#    application question contains ANY of them, the rule fires.
+#  - Rules are checked top-to-bottom; the first match wins, so put the most
+#    specific rules first.
+#  - `answer` supports {placeholders} filled from your profile and the job:
+#      {company} {role} {location}
+#      {first_name} {last_name} {full_name} {email} {phone}
+#      {years_experience} {current_title} {current_company}
+#      {desired_title} {salary} {linkedin} {github} {portfolio}
+#  - `type: choice` rules answer dropdowns/radios by returning a fixed value.
+#  - If nothing matches, the engine returns `default` (or leaves optional
+#    free-text blank and flags the question for your review).
+
+default: ""
+
+rules:
+  # ---- Structured / factual questions (answered from profile) ------------
+  - match_any: ["desired salary", "salary expectation", "expected salary", "compensation expectation"]
+    answer: "{salary}"
+
+  - match_any: ["years of experience", "how many years"]
+    answer: "{years_experience}"
+
+  - match_any: ["notice period", "how soon can you start", "earliest start", "available to start"]
+    answer: "Immediately / two weeks' notice"
+
+  - match_any: ["authorized to work", "legally authorized", "right to work"]
+    type: choice
+    answer: "Yes"
+
+  - match_any: ["require sponsorship", "need sponsorship", "visa sponsorship"]
+    type: choice
+    answer: "No"
+
+  - match_any: ["willing to relocate", "open to relocation"]
+    type: choice
+    answer: "Yes"
+
+  - match_any: ["how did you hear", "where did you hear", "referral source"]
+    answer: "Company careers page"
+
+  # ---- Free-text motivation questions ------------------------------------
+  - match_any: ["why do you want", "why are you interested", "why this role",
+                "why our company", "why this company", "why do you want to work"]
+    answer: >-
+      I'm excited about the {role} role at {company} because it's a strong
+      match for my background as a {current_title} with {years_experience}
+      years of experience. The scope of the position lines up closely with
+      the work I do best, and I'm looking to bring that experience to a team
+      where I can contribute quickly and keep growing. I'd welcome the chance
+      to talk through how my skills map to what {company} needs.
+
+  - match_any: ["cover letter", "anything else", "tell us about yourself",
+                "additional information", "why should we hire"]
+    answer: >-
+      I'm a {current_title} with {years_experience} years of hands-on
+      experience and a track record of shipping reliable, well-tested work.
+      I read the {role} description closely and my experience aligns well with
+      the core responsibilities. I'm confident I can ramp up fast and add value
+      to {company} from day one. My resume and links have the full detail:
+      LinkedIn {linkedin}, GitHub {github}.
+
+  - match_any: ["greatest strength", "your strengths", "what makes you a good fit"]
+    answer: >-
+      My biggest strength is turning ambiguous requirements into shipped,
+      maintainable software. I'm pragmatic, communicate clearly, and I care
+      about correctness — which is exactly what the {role} role at {company}
+      calls for.
+
+  - match_any: ["salary", "compensation"]
+    answer: "{salary}"
