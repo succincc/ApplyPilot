@@ -97,6 +97,32 @@ drop trigger if exists profile_touch on profile;
 create trigger profile_touch before update on profile
   for each row execute function touch_profile();
 
+-- Interview prep, generated automatically when an interview email lands
+create table if not exists interview_prep (
+  id uuid primary key default gen_random_uuid(),
+  job_url text unique not null,
+  job_id uuid references jobs(id) on delete cascade,
+  company text, title text,
+  likely_questions text, talking_points text,
+  questions_to_ask text, company_notes text,
+  created_at timestamptz default now()
+);
+
+-- Follow-up email drafts for applications that went silent
+create table if not exists followups (
+  id uuid primary key default gen_random_uuid(),
+  job_url text unique not null,
+  job_id uuid references jobs(id) on delete cascade,
+  company text, title text,
+  to_address text, subject text, body text,
+  status text default 'draft',      -- draft | sent | dismissed
+  days_since int,
+  created_at timestamptz default now()
+);
+
+-- Hands-off scheduling: run automatically every N hours (0 = manual only)
+alter table search_presets add column if not exists auto_run_hours numeric default 0;
+
 -- Indexes that matter once you have thousands of rows
 create index if not exists idx_jobs_status on jobs(status);
 create index if not exists idx_jobs_applied_at on jobs(applied_at desc);
@@ -109,13 +135,16 @@ alter table emails enable row level security;
 alter table target_companies enable row level security;
 
 alter table profile enable row level security;
+alter table interview_prep enable row level security;
+alter table followups enable row level security;
 
 do $$
 declare
   uid text := 'YOUR-AUTH-USER-UUID';
   t text;
 begin
-  foreach t in array array['questions','emails','target_companies','profile'] loop
+  foreach t in array array['questions','emails','target_companies','profile',
+                           'interview_prep','followups'] loop
     execute format('drop policy if exists owner_all on %I', t);
     execute format('create policy owner_all on %I for all using (auth.uid() = %L)', t, uid);
   end loop;
@@ -270,6 +299,49 @@ Then enable **Realtime** on `jobs`, `engine_status`, `commands`, and `emails`.
 > Explain in one line: "The token is the company's slug in its job-board URL —
 > `job-boards.greenhouse.io/stripe` means the token is `stripe`. These boards
 > are the highest-success application path."
+
+---
+
+## Prompt E2 — interview prep & follow-ups
+
+> Build a **Prep** page with two tabs. This is what happens after an
+> application gets a response, and it is the highest-value screen in the app.
+>
+> **Interviews** tab, over `interview_prep`: one expandable card per row,
+> newest first, headed by title and company. Inside, four labeled sections
+> rendered as readable lists (the text arrives as newline-separated lines
+> beginning with "- "): **Likely questions**, **Your talking points**,
+> **Questions to ask them**, and a short **About this role** paragraph from
+> `company_notes`. Add a "Copy all" button that copies the whole pack as
+> plain text, and a link to the linked job. Empty state: "No interviews yet.
+> Prep is generated automatically the moment an interview email lands."
+>
+> **Follow-ups** tab, over `followups` where `status='draft'`: one card per
+> draft showing company, title, "applied {days_since} days ago", the editable
+> `subject`, and the editable `body` in a textarea. Three actions per card:
+> **Copy** (copies subject + body), **Mark sent** (sets `status='sent'`), and
+> **Dismiss** (sets `status='dismissed'`). When `to_address` is present, also
+> show a **Open in email** button linking to
+> `mailto:{to_address}?subject={subject}&body={body}` (URL-encoded).
+>
+> Add a clear note at the top of the Follow-ups tab: "These are drafts. Nothing
+> is ever sent automatically — read it, edit it, then send." Show a count badge
+> in the nav for draft follow-ups plus prep packs you haven't opened.
+
+---
+
+## Prompt E3 — hands-off scheduling
+
+> In the Search Preset form, add an **Automation** field: a select bound to
+> `auto_run_hours` with options Manual only (0), Every 4 hours (4), Every 8
+> hours (8), Every 12 hours (12), Once a day (24). Label it "Run automatically"
+> with helper text: "The engine starts a full discovery-and-apply cycle on this
+> schedule with no button press. It still respects your daily apply cap and
+> your AI budget."
+>
+> On the Dashboard, when the active preset has `auto_run_hours > 0`, show a
+> small pill next to the Start button reading "Auto: every Nh" so it is obvious
+> the system is running on its own.
 
 ---
 

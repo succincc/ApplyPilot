@@ -641,6 +641,121 @@ class SyncDaemon:
             self.sb.upsert("questions", push, on_conflict="question_normalized")
             logger.info("Pushed %d new question(s) to panel", len(push))
 
+    # -- scheduled autonomous runs -----------------------------------------
+
+    def check_schedule(self) -> None:
+        """Start a run on a fixed interval, with no button press.
+
+        The active preset's `auto_run_hours` (0 = manual only) makes the
+        system genuinely hands-off: it keeps finding and applying while you
+        do something else, the same cadence the paid tools advertise.
+        Skipped while a run is already in flight or setup is incomplete.
+        """
+        hours = self.preset.get("auto_run_hours") or 0
+        try:
+            hours = float(hours)
+        except (TypeError, ValueError):
+            return
+        if hours <= 0:
+            return
+
+        running = any(p and p.poll() is None
+                      for p in (self.run_proc, self.apply_proc))
+        if running:
+            return
+
+        marker = config.APP_DIR / ".last_auto_run"
+        if marker.exists():
+            try:
+                last = datetime.fromisoformat(marker.read_text(encoding="utf-8").strip())
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
+                if (datetime.now(timezone.utc) - last).total_seconds() < hours * 3600:
+                    return
+            except (ValueError, OSError):
+                pass
+
+        problems = self.preflight()
+        if problems:
+            self.report_blocked(problems)
+            return
+
+        logger.info("Scheduled run starting (every %sh)", hours)
+        marker.write_text(datetime.now(timezone.utc).isoformat(), encoding="utf-8")
+        try:
+            self.start_run(self.preset.get("id"))
+        except Exception:
+            logger.exception("Scheduled run failed to start")
+
+    # -- interview prep + follow-ups ---------------------------------------
+
+    def sync_coach(self) -> None:
+        """Generate prep packs and follow-up drafts, then push them up."""
+        from applypilot import coach
+
+        try:
+            result = coach.run(limit=10)
+        except Exception:
+            logger.exception("Coach generation failed")
+            return
+
+        if result["preps"] or result["followups"]:
+            logger.info("Coach: %d prep pack(s), %d follow-up draft(s)",
+                        result["preps"], result["followups"])
+
+        conn = get_connection()
+        coach.ensure_tables(conn)
+
+        def _job_id(url: str) -> str | None:
+            try:
+                rows = self.sb.select(
+                    "jobs", f"url=eq.{httpx.QueryParams({'u': url})['u']}&select=id")
+                return rows[0]["id"] if rows else None
+            except httpx.HTTPError:
+                return None
+
+        preps = []
+        for row in conn.execute("SELECT * FROM interview_prep"):
+            row = dict(row)
+            preps.append({
+                "job_url": row["job_url"],
+                "job_id": _job_id(row["job_url"]),
+                "company": row.get("company"),
+                "title": row.get("title"),
+                "likely_questions": row.get("likely_questions"),
+                "talking_points": row.get("talking_points"),
+                "questions_to_ask": row.get("questions_to_ask"),
+                "company_notes": row.get("company_notes"),
+            })
+        if preps:
+            self.sb.upsert("interview_prep", preps, on_conflict="job_url")
+
+        drafts = []
+        for row in conn.execute("SELECT * FROM followups WHERE status = 'draft'"):
+            row = dict(row)
+            drafts.append({
+                "job_url": row["job_url"],
+                "job_id": _job_id(row["job_url"]),
+                "company": row.get("company"),
+                "title": row.get("title"),
+                "to_address": row.get("to_address"),
+                "subject": row.get("subject"),
+                "body": row.get("body"),
+                "days_since": row.get("days_since"),
+                "status": "draft",
+            })
+        if drafts:
+            self.sb.upsert("followups", drafts, on_conflict="job_url")
+
+        # Pull back statuses set in the panel (sent / dismissed)
+        try:
+            for r in self.sb.select("followups", "status=neq.draft&select=job_url,status"):
+                conn.execute("UPDATE followups SET status = ? WHERE job_url = ?",
+                             (r["status"], r["job_url"]))
+            conn.commit()
+        except httpx.HTTPError:
+            pass
+
     # -- profile + resume from the panel ------------------------------------
 
     def sync_profile(self) -> None:
@@ -898,6 +1013,8 @@ class SyncDaemon:
                     self._last["mirror"] = now
                 if now - self._last["mail"] >= MAIL_INTERVAL:
                     self.sync_mail()
+                    self.sync_coach()
+                    self.check_schedule()
                     self._last["mail"] = now
             except httpx.HTTPError as e:
                 logger.warning("Supabase unreachable (%s) — retrying", e)

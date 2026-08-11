@@ -47,11 +47,12 @@ DEFAULT_DAILY_BUDGET = 1400
 # The apply stage's share is small because form-filling runs on Claude Code,
 # not on this quota. Shares must sum to 1.0.
 STAGE_RESERVATIONS: dict[str, float] = {
-    "score": 0.50,   # ~1 request per discovered job — the bulk of the spend
+    "score": 0.48,   # ~1 request per discovered job — the bulk of the spend
     "tailor": 0.20,  # per job above threshold, retried on validation failure
-    "cover": 0.15,   # per job above threshold
+    "cover": 0.14,   # per job above threshold
     "enrich": 0.08,  # AI description extraction for unknown page layouts
-    "mail": 0.04,    # ambiguous email classification only
+    "coach": 0.04,   # interview prep + follow-up drafts (rare, high value)
+    "mail": 0.03,    # ambiguous email classification only
     "apply": 0.03,   # screening-answer help during submission
 }
 

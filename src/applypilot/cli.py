@@ -297,6 +297,46 @@ def mail(
 
 
 @app.command()
+def coach(
+    job_url: Optional[str] = typer.Option(None, "--url", help="Generate prep for one specific job."),
+    followups_only: bool = typer.Option(False, "--followups", help="Only draft follow-ups."),
+    prep_only: bool = typer.Option(False, "--prep", help="Only generate interview prep."),
+) -> None:
+    """Generate interview prep packs and follow-up email drafts."""
+    _bootstrap()
+
+    from applypilot.config import check_tier
+    check_tier(2, "interview prep and follow-ups")
+
+    from applypilot import coach as coach_mod
+
+    if job_url:
+        pack = coach_mod.generate_prep(job_url, force=True)
+        if not pack:
+            console.print("[yellow]No prep generated — check the job URL exists and has a description.[/yellow]")
+            raise typer.Exit(code=1)
+        console.print(f"\n[bold]Interview prep — {pack['title']} @ {pack['company']}[/bold]\n")
+        console.print(f"[dim]{pack['company_notes']}[/dim]\n")
+        console.print("[bold cyan]Likely questions[/bold cyan]")
+        console.print(pack["likely_questions"])
+        console.print("\n[bold cyan]Your talking points[/bold cyan]")
+        console.print(pack["talking_points"])
+        console.print("\n[bold cyan]Ask them[/bold cyan]")
+        console.print(pack["questions_to_ask"])
+        console.print()
+        return
+
+    preps = 0 if followups_only else coach_mod.generate_pending_preps(limit=5)
+    drafts = 0 if prep_only else coach_mod.draft_pending_followups(limit=10)
+
+    console.print(
+        f"\n  [bold]{preps}[/bold] interview prep pack(s) generated\n"
+        f"  [bold]{drafts}[/bold] follow-up draft(s) queued "
+        f"[dim](review and send from the panel — nothing is sent automatically)[/dim]\n"
+    )
+
+
+@app.command()
 def verify() -> None:
     """Live-test every free job API and your mail connection. Run this before your first real run."""
     _bootstrap()
