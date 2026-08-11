@@ -487,6 +487,34 @@ def status() -> None:
 
         console.print(dist_table)
 
+    # Daily AI request usage (free-tier headroom, not money)
+    from applypilot import budget as budget_mod
+    b = budget_mod.summary()
+    if b["unlimited"]:
+        console.print("\n[dim]AI requests: unlimited (local model — no quota)[/dim]")
+    else:
+        pct = b["percent_used"]
+        color = "green" if pct < 70 else ("yellow" if pct < 90 else "red")
+        budget_table = Table(title="\nDaily AI Requests (free tier — not billed)",
+                             show_header=True, header_style="bold cyan")
+        budget_table.add_column("Stage")
+        budget_table.add_column("Used", justify="right")
+        budget_table.add_column("Reserved/day", justify="right")
+
+        for stage, share in budget_mod.STAGE_RESERVATIONS.items():
+            used = b["by_stage"].get(stage, 0)
+            budget_table.add_row(stage, str(used), str(int(b["limit"] * share)))
+        budget_table.add_row(
+            "[bold]total[/bold]",
+            f"[{color}]{b['used']}[/{color}]",
+            f"[bold]{b['limit']}[/bold]",
+        )
+        console.print(budget_table)
+        console.print(
+            f"  [{color}]{pct}% of today's free-tier requests used[/{color}] "
+            f"[dim]({b['remaining']} left — resets at UTC midnight, costs nothing)[/dim]"
+        )
+
     # By site
     if stats["by_site"]:
         site_table = Table(title="\nJobs by Source", show_header=True, header_style="bold magenta")
