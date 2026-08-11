@@ -183,6 +183,9 @@ _ALL_COLUMNS: dict[str, str] = {
     # Panel sync (Mission Control bridge)
     "panel_approved": "INTEGER DEFAULT 0",
     "original_fit_score": "INTEGER",
+    # Outcome tracking (driven by classified email)
+    "outcome": "TEXT",
+    "outcome_at": "TEXT",
 }
 
 

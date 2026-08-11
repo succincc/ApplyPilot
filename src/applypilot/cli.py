@@ -257,6 +257,130 @@ def apply(
 
 
 @app.command()
+def mail(
+    days: int = typer.Option(30, "--days", help="How many days back to scan."),
+    limit: int = typer.Option(200, "--limit", help="Max messages to examine."),
+) -> None:
+    """Fetch and classify job-related email (interview / offer / rejection / action needed)."""
+    _bootstrap()
+
+    from applypilot.mail import fetch_and_store
+
+    console.print("\n[bold blue]Scanning inbox...[/bold blue]")
+    stats = fetch_and_store(lookback_days=days, limit=limit)
+
+    if stats.get("error"):
+        console.print(f"[red]{stats['error']}[/red]")
+        raise typer.Exit(code=1)
+
+    console.print(
+        f"\n  Examined [bold]{stats['fetched']}[/bold] messages, "
+        f"stored [bold]{stats['stored']}[/bold] job-related "
+        f"([dim]{stats['skipped']} personal/unrelated skipped[/dim])"
+    )
+
+    if stats["by_category"]:
+        icons = {"interview": "[green]interview[/green]",
+                 "offer": "[bold green]offer[/bold green]",
+                 "rejection": "[red]rejection[/red]",
+                 "action_needed": "[yellow]action needed[/yellow]",
+                 "confirmation": "[dim]confirmation[/dim]",
+                 "other": "[dim]other[/dim]"}
+        console.print()
+        for category, count in sorted(stats["by_category"].items(),
+                                      key=lambda kv: -kv[1]):
+            console.print(f"  {count:>4}  {icons.get(category, category)}")
+
+    if stats["advanced"]:
+        console.print(f"\n  [bold]{stats['advanced']}[/bold] application(s) advanced by email")
+    console.print()
+
+
+@app.command()
+def verify() -> None:
+    """Live-test every free job API and your mail connection. Run this before your first real run."""
+    _bootstrap()
+
+    console.print("\n[bold]ApplyPilot Verify — live connectivity test[/bold]\n")
+
+    ok_mark = "[green]OK[/green]"
+    fail_mark = "[red]FAIL[/red]"
+    skip_mark = "[dim]skip[/dim]"
+    results: list[tuple[str, str, str]] = []
+
+    from applypilot.discovery import ats
+
+    # Public ATS boards — well-known tokens that should always have openings
+    for label, fn, token in (
+        ("Greenhouse API", ats.fetch_greenhouse, "stripe"),
+        ("Lever API", ats.fetch_lever, "netflix"),
+        ("Ashby API", ats.fetch_ashby, "ramp"),
+    ):
+        try:
+            jobs = fn(token)
+            results.append((label, ok_mark if jobs else fail_mark,
+                            f"{len(jobs)} jobs from '{token}'"))
+        except Exception as e:
+            results.append((label, fail_mark, f"{type(e).__name__}: {str(e)[:60]}"))
+
+    for label, fn in (("Remotive API", ats.fetch_remotive),
+                      ("RemoteOK API", ats.fetch_remoteok),
+                      ("Arbeitnow API", ats.fetch_arbeitnow)):
+        try:
+            jobs = fn()
+            results.append((label, ok_mark if jobs else fail_mark, f"{len(jobs)} jobs"))
+        except Exception as e:
+            results.append((label, fail_mark, f"{type(e).__name__}: {str(e)[:60]}"))
+
+    # USAJobs (optional key)
+    import os
+    if os.environ.get("USAJOBS_API_KEY"):
+        try:
+            jobs = ats.fetch_usajobs("software engineer")
+            results.append(("USAJobs API", ok_mark if jobs else fail_mark, f"{len(jobs)} jobs"))
+        except Exception as e:
+            results.append(("USAJobs API", fail_mark, str(e)[:60]))
+    else:
+        results.append(("USAJobs API", skip_mark, "set USAJOBS_API_KEY to enable"))
+
+    # Mail
+    if os.environ.get("MAIL_APP_PASSWORD"):
+        from applypilot.mail import fetch_and_store
+        stats = fetch_and_store(lookback_days=7, limit=25)
+        if stats.get("error"):
+            results.append(("Email (IMAP)", fail_mark, stats["error"][:70]))
+        else:
+            results.append(("Email (IMAP)", ok_mark,
+                            f"{stats['fetched']} scanned, {stats['stored']} job-related"))
+    else:
+        results.append(("Email (IMAP)", skip_mark, "set MAIL_APP_PASSWORD to enable Inbox"))
+
+    # Supabase bridge
+    if os.environ.get("SUPABASE_URL") and os.environ.get("SUPABASE_SERVICE_KEY"):
+        try:
+            from applypilot.sync import connect
+            sb = connect()
+            sb.select("jobs", "limit=1")
+            results.append(("Supabase bridge", ok_mark, "connected, jobs table readable"))
+        except Exception as e:
+            results.append(("Supabase bridge", fail_mark, str(e)[:70]))
+    else:
+        results.append(("Supabase bridge", skip_mark, "set SUPABASE_URL + SUPABASE_SERVICE_KEY"))
+
+    col_w = max(len(r[0]) for r in results) + 2
+    for check, status, note in results:
+        console.print(f"  {check}{' ' * (col_w - len(check))}{status}  [dim]{note}[/dim]")
+
+    failed = sum(1 for _, s, _ in results if s == fail_mark)
+    console.print()
+    if failed:
+        console.print(f"[yellow]{failed} check(s) failed.[/yellow] "
+                      "Network blocks or bad credentials are the usual cause.\n")
+        raise typer.Exit(code=1)
+    console.print("[green]All active checks passed.[/green]\n")
+
+
+@app.command()
 def sync(
     once: bool = typer.Option(False, "--once", help="Run a single sync cycle and exit (for testing)."),
 ) -> None:

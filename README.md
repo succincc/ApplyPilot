@@ -148,6 +148,38 @@ Claude Code launches a Chrome instance, navigates to each application page, dete
 
 The Playwright MCP server is configured automatically at runtime per worker. No manual MCP setup needed.
 
+---
+
+## Mission Control (web panel)
+
+ApplyPilot can be driven from a private web panel instead of the CLI — filters,
+a Start button, a pipeline board, a categorized email inbox, and a screening-answer
+memory bank, all from your phone.
+
+The panel is built with [Lovable](https://lovable.dev) on Supabase's free tier;
+the engine keeps running on your own machine (home IP + real Chrome is the
+lowest-detection setup there is). They communicate only through Supabase.
+
+```bash
+applypilot verify    # live-test every job API, your mail, and Supabase
+applypilot sync      # bridge: panel goes live, Start button works
+applypilot mail      # fetch + classify job email on demand
+./start.sh           # launcher: guards setup, restarts the bridge on crash
+```
+
+| Document | What it covers |
+|---|---|
+| [ROADMAP.md](ROADMAP.md) | Architecture, phases, volume doctrine, cost budget |
+| [docs/LOVABLE_FINAL.md](docs/LOVABLE_FINAL.md) | Paste-ready prompts to build the panel |
+| [docs/BRIDGE_SPEC.md](docs/BRIDGE_SPEC.md) | Supabase schema and sync contract |
+| [docs/GO_LIVE.md](docs/GO_LIVE.md) | Setup order and the dry-run proof |
+| [docs/HARDENING.md](docs/HARDENING.md) | Seed data, smoke test, hardening prompts |
+
+Everything runs on free tiers. Nothing in the stack can paywall you, throttle
+you, or read your data.
+
+---
+
 ```bash
 # Utility modes (no Chrome/Claude needed)
 applypilot apply --mark-applied URL    # manually mark a job as applied

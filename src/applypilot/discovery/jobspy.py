@@ -79,43 +79,47 @@ def _scrape_with_retry(kwargs: dict, max_retries: int = 2, backoff: float = 5.0)
 def _load_location_config(search_cfg: dict) -> tuple[list[str], list[str]]:
     """Extract accept/reject location lists from search config.
 
-    Falls back to sensible defaults if not defined in the YAML.
+    Delegates to filters.load_filter_config so both the nested
+    (`location: {accept_patterns}`) and flat (`location_accept`) schema
+    shapes work. Reading only the flat key used to leave the accept list
+    empty for the shipped config, which rejected every non-remote job.
     """
-    accept = search_cfg.get("location_accept", [])
-    reject = search_cfg.get("location_reject_non_remote", [])
-    return accept, reject
+    from applypilot.filters import load_filter_config
+    f = load_filter_config(search_cfg)
+    return f["location_accept"], f["location_reject"]
 
 
 def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> bool:
     """Check if a job location passes the user's location filter.
 
-    Remote jobs are always accepted. Non-remote jobs must match an accept
-    pattern and not match a reject pattern.
+    Remote and unknown locations always pass. An empty accept list means
+    'no restriction', not 'reject everything'.
     """
-    if not location:
-        return True  # unknown location -- keep it, let scorer decide
-
-    loc = location.lower()
-
-    # Remote jobs always OK
-    if any(r in loc for r in ("remote", "anywhere", "work from home", "wfh", "distributed")):
-        return True
-
-    # Reject non-remote matches
-    for r in reject:
-        if r.lower() in loc:
-            return False
-
-    # Accept matches
-    for a in accept:
-        if a.lower() in loc:
-            return True
-
-    # No match -- reject unknown
-    return False
+    from applypilot.filters import location_ok
+    passed, _ = location_ok(location, [a.lower() for a in accept], [r.lower() for r in reject])
+    return passed
 
 
 # -- DB storage (JobSpy DataFrame -> SQLite) ---------------------------------
+
+def _build_salary_text(row) -> str | None:
+    """Reconstruct a salary string from a JobSpy row's min/max/interval."""
+    min_amt = row.get("min_amount")
+    max_amt = row.get("max_amount")
+    interval = str(row.get("interval", "")) if str(row.get("interval", "")) != "nan" else ""
+    currency = str(row.get("currency", "")) if str(row.get("currency", "")) != "nan" else ""
+
+    if not min_amt or str(min_amt) == "nan":
+        return None
+
+    if max_amt and str(max_amt) != "nan":
+        salary = f"{currency}{int(float(min_amt)):,}-{currency}{int(float(max_amt)):,}"
+    else:
+        salary = f"{currency}{int(float(min_amt)):,}"
+    if interval:
+        salary += f"/{interval}"
+    return salary
+
 
 def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tuple[int, int]:
     """Store JobSpy DataFrame results into the DB. Returns (new, existing)."""
@@ -192,8 +196,7 @@ def _run_one_search(
     proxy_config: dict | None,
     defaults: dict,
     max_retries: int,
-    accept_locs: list[str],
-    reject_locs: list[str],
+    filters: dict,
     glassdoor_map: dict,
 ) -> dict:
     """Run a single search query and store results in DB."""
@@ -268,12 +271,35 @@ def _run_one_search(
         log.info("[%s] 0 results", label)
         return {"new": 0, "existing": 0, "errors": 0, "filtered": 0, "total": 0, "label": label}
 
-    # Filter by location before storing
+    # Apply every configured filter before storing (location, title,
+    # company, salary floor, no-go patterns). Rejection reasons are counted
+    # so the log shows WHY volume dropped, not just that it did.
+    from applypilot.filters import job_passes
+
     before = len(df)
-    df = df[df.apply(lambda row: _location_ok(
-        str(row.get("location", "")) if str(row.get("location", "")) != "nan" else None,
-        accept_locs, reject_locs,
-    ), axis=1)]
+    reject_counts: dict[str, int] = {}
+
+    def _keep(row) -> bool:
+        def _clean(key):
+            val = str(row.get(key, ""))
+            return None if val in ("nan", "") else val
+
+        passed, reason = job_passes(
+            {
+                "title": _clean("title"),
+                "company": _clean("company"),
+                "location": _clean("location"),
+                "salary": _build_salary_text(row),
+                "description": _clean("description"),
+            },
+            filters,
+        )
+        if not passed and reason:
+            key = reason.split(":")[0]
+            reject_counts[key] = reject_counts.get(key, 0) + 1
+        return passed
+
+    df = df[df.apply(_keep, axis=1)]
     filtered = before - len(df)
 
     conn = get_connection()
@@ -281,7 +307,8 @@ def _run_one_search(
 
     msg = f"[{label}] {before} results -> {new} new, {existing} dupes"
     if filtered:
-        msg += f", {filtered} filtered (location)"
+        detail = ", ".join(f"{k} {v}" for k, v in sorted(reject_counts.items()))
+        msg += f", {filtered} filtered ({detail})"
     log.info(msg)
 
     return {"new": new, "existing": existing, "errors": 0, "filtered": filtered, "total": before, "label": label}
@@ -372,11 +399,13 @@ def _full_crawl(
         sites = ["indeed", "linkedin", "zip_recruiter"]
 
     # Build search combinations from config
+    from applypilot.filters import load_filter_config
+
     queries = search_cfg.get("queries", [])
     locs = search_cfg.get("locations", [])
     defaults = search_cfg.get("defaults", {})
     glassdoor_map = search_cfg.get("glassdoor_location_map", {})
-    accept_locs, reject_locs = _load_location_config(search_cfg)
+    filters = load_filter_config(search_cfg)
 
     if tiers:
         queries = [q for q in queries if q.get("tier") in tiers]
@@ -411,7 +440,7 @@ def _full_crawl(
         result = _run_one_search(
             s, sites, results_per_site, hours_old,
             proxy_config, defaults, max_retries,
-            accept_locs, reject_locs, glassdoor_map,
+            filters, glassdoor_map,
         )
         completed += 1
         total_new += result["new"]
@@ -460,8 +489,13 @@ def run_discovery(cfg: dict | None = None) -> dict:
         log.warning("No search configuration found. Run `applypilot init` to create one.")
         return {"new": 0, "existing": 0, "errors": 0, "db_total": 0, "queries": 0}
 
+    from applypilot.filters import get_boards
+
     proxy = cfg.get("proxy")
-    sites = cfg.get("sites")
+    # Accepts either `boards` (what the panel and example config write) or
+    # the legacy `sites` key. Reading only `sites` meant board selection was
+    # ignored and Glassdoor/Google Jobs never ran.
+    sites = get_boards(cfg)
     results_per_site = cfg.get("defaults", {}).get("results_per_site", 100)
     hours_old = cfg.get("defaults", {}).get("hours_old", 72)
     tiers = cfg.get("tiers")

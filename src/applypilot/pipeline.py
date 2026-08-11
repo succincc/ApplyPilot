@@ -61,7 +61,24 @@ _UPSTREAM: dict[str, str | None] = {
 
 def _run_discover(workers: int = 1) -> dict:
     """Stage: Job discovery — JobSpy, Workday, and smart-extract scrapers."""
-    stats: dict = {"jobspy": None, "workday": None, "smartextract": None}
+    stats: dict = {"jobspy": None, "ats": None, "workday": None, "smartextract": None}
+
+    # Free public ATS + government APIs. Runs first: no scraping, no rate
+    # limits, full descriptions inline, and the resulting jobs point straight
+    # at employer application forms (the highest auto-apply success path).
+    console.print("  [cyan]Direct ATS / public APIs...[/cyan]")
+    try:
+        from applypilot.discovery.ats import run_discovery as run_ats_discovery
+        ats_stats = run_ats_discovery()
+        stats["ats"] = ats_stats
+        console.print(
+            f"  [green]ATS APIs:[/green] {ats_stats['new']} new "
+            f"({ats_stats['filtered']} filtered, {ats_stats['errors']} errors)"
+        )
+    except Exception as e:
+        log.error("ATS API discovery failed: %s", e)
+        console.print(f"  [red]ATS API error:[/red] {e}")
+        stats["ats"] = f"error: {e}"
 
     # JobSpy
     console.print("  [cyan]JobSpy full crawl...[/cyan]")

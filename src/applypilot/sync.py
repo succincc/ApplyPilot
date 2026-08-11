@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 HEARTBEAT_INTERVAL = 30
 COMMAND_INTERVAL = 15
 MIRROR_INTERVAL = 60
+MAIL_INTERVAL = 600
 UPSERT_BATCH = 200
 
 # Panel statuses set by a human — the engine must never overwrite these.
@@ -137,6 +138,12 @@ def derive_status(row: dict, review_low: int = 4, auto_min: int = 6) -> tuple[st
     apply_status = row.get("apply_status") or ""
     apply_error = row.get("apply_error") or ""
 
+    # An outcome learned from classified email outranks everything: once a
+    # recruiter has replied, that reply is the truth about this application.
+    outcome = row.get("outcome")
+    if outcome in ("interview", "offer", "rejection"):
+        return {"rejection": "rejected"}.get(outcome, outcome), None
+
     if row.get("applied_at"):
         return "applied", None
     if apply_status == "in_progress":
@@ -188,7 +195,7 @@ class SyncDaemon:
         self.apply_proc: subprocess.Popen | None = None
         self.stopping = False
         self.preset: dict = {}
-        self._last = {"heartbeat": 0.0, "commands": 0.0, "mirror": 0.0}
+        self._last = {"heartbeat": 0.0, "commands": 0.0, "mirror": 0.0, "mail": 0.0}
 
     # -- engine status -----------------------------------------------------
 
@@ -629,6 +636,84 @@ class SyncDaemon:
             self.sb.upsert("questions", push, on_conflict="question_normalized")
             logger.info("Pushed %d new question(s) to panel", len(push))
 
+    # -- email ingest + push ------------------------------------------------
+
+    def sync_mail(self) -> None:
+        """Fetch and classify new mail, then push it to the panel's Inbox."""
+        from applypilot import mail as mail_mod
+
+        if not os.environ.get("MAIL_APP_PASSWORD"):
+            return
+
+        stats = mail_mod.fetch_and_store(lookback_days=14, limit=100)
+        if stats.get("error"):
+            logger.warning("Mail ingest: %s", stats["error"])
+            return
+        if stats["stored"]:
+            logger.info("Mail: %d new job-related (%s)",
+                        stats["stored"], stats["by_category"])
+
+        conn = get_connection()
+        mail_mod.ensure_table(conn)
+
+        # Map local job URLs to cloud job UUIDs so emails link correctly
+        url_to_id: dict[str, str] = {}
+        linked_urls = [r[0] for r in conn.execute(
+            "SELECT DISTINCT job_url FROM emails WHERE job_url IS NOT NULL")]
+        for url in linked_urls:
+            try:
+                rows = self.sb.select(
+                    "jobs",
+                    f"url=eq.{httpx.QueryParams({'u': url})['u']}&select=id")
+                if rows:
+                    url_to_id[url] = rows[0]["id"]
+            except httpx.HTTPError:
+                continue
+
+        existing = {e["gmail_id"] for e in
+                    self.sb.select("emails", "select=gmail_id")}
+
+        push = []
+        for row in conn.execute(
+                "SELECT * FROM emails ORDER BY received_at DESC LIMIT 500"):
+            row = dict(row)
+            if row["message_id"] in existing:
+                continue
+            push.append({
+                "gmail_id": row["message_id"],
+                "from_address": row.get("from_address"),
+                "subject": row.get("subject"),
+                "snippet": row.get("snippet"),
+                "body_text": (row.get("body_text") or "")[:15000] or None,
+                "received_at": row.get("received_at"),
+                "category": row.get("category"),
+                "classified_by": row.get("classified_by"),
+                "job_id": url_to_id.get(row.get("job_url")),
+                "is_read": bool(row.get("is_read")),
+            })
+
+        if push:
+            self.sb.upsert("emails", push, on_conflict="gmail_id")
+            logger.info("Pushed %d email(s) to panel", len(push))
+
+    def sync_target_companies(self) -> None:
+        """Write the panel's company registry where ATS discovery reads it."""
+        try:
+            rows = self.sb.select("target_companies", "enabled=eq.true&select=*")
+        except httpx.HTTPError:
+            return
+
+        path = config.APP_DIR / "target_companies.yaml"
+        payload = {"companies": [
+            {"company": r.get("company"), "ats": r.get("ats"),
+             "board_token": r.get("board_token"), "enabled": True}
+            for r in rows
+        ]}
+        new_text = yaml.safe_dump(payload, sort_keys=False, allow_unicode=True)
+        if not path.exists() or path.read_text(encoding="utf-8") != new_text:
+            path.write_text(new_text, encoding="utf-8")
+            logger.info("Updated target_companies.yaml (%d companies)", len(rows))
+
     # -- main loop ---------------------------------------------------------
 
     def loop(self, once: bool = False) -> None:
@@ -654,7 +739,11 @@ class SyncDaemon:
                     self.pull_decisions()
                     self.mirror_jobs()
                     self.sync_questions()
+                    self.sync_target_companies()
                     self._last["mirror"] = now
+                if now - self._last["mail"] >= MAIL_INTERVAL:
+                    self.sync_mail()
+                    self._last["mail"] = now
             except httpx.HTTPError as e:
                 logger.warning("Supabase unreachable (%s) — retrying", e)
             except Exception:
