@@ -554,30 +554,43 @@ def _is_permanent_failure(result: str) -> bool:
 def worker_loop(worker_id: int = 0, limit: int = 1,
                 target_url: str | None = None,
                 min_score: int = 7, headless: bool = False,
-                model: str = "sonnet", dry_run: bool = False) -> tuple[int, int]:
-    """Run jobs sequentially until limit is reached or queue is empty.
+                model: str = "sonnet", dry_run: bool = False,
+                continuous: bool = False) -> tuple[int, int]:
+    """Run jobs until the limit is reached, or forever in continuous mode.
 
     Args:
         worker_id: Numeric worker identifier.
-        limit: Max jobs to process (0 = continuous).
+        limit: Max jobs to process (0 = no limit).
         target_url: Apply to a specific URL.
         min_score: Minimum fit_score threshold.
         headless: Run Chrome headless.
         model: Claude model name.
         dry_run: Don't click Submit.
+        continuous: Keep polling when the queue empties instead of exiting.
+            Independent of `limit`, so a daily cap can be enforced while
+            still waiting for the pipeline to produce more work.
 
     Returns:
         Tuple of (applied_count, failed_count).
     """
     applied = 0
     failed = 0
-    continuous = limit == 0
+    # Derive continuity from limit only when not stated explicitly, so
+    # `limit=100, continuous=True` means "wait for work, but stop at 100"
+    # rather than silently becoming unlimited.
+    if not continuous and limit == 0:
+        continuous = True
     jobs_done = 0
     empty_polls = 0
     port = BASE_CDP_PORT + worker_id
 
     while not _stop_event.is_set():
-        if not continuous and jobs_done >= limit:
+        # A limit applies in continuous mode too — that is how the panel's
+        # daily_apply_cap is enforced while still waiting for new work.
+        if limit > 0 and jobs_done >= limit:
+            add_event(f"[W{worker_id}] Reached limit of {limit}")
+            break
+        if not continuous and limit == 0 and jobs_done > 0:
             break
 
         update_state(worker_id, status="idle", job_title="", company="",
@@ -681,8 +694,10 @@ def main(limit: int = 1, target_url: str | None = None,
     console = Console()
 
     if continuous:
-        effective_limit = 0
-        mode_label = "continuous"
+        # Preserve an explicit cap; only an unset/zero limit means unlimited.
+        effective_limit = limit if limit and limit > 0 else 0
+        mode_label = (f"continuous, max {effective_limit}"
+                      if effective_limit else "continuous")
     else:
         effective_limit = limit
         mode_label = f"{limit} jobs"
@@ -743,6 +758,7 @@ def main(limit: int = 1, target_url: str | None = None,
                     headless=headless,
                     model=model,
                     dry_run=dry_run,
+                    continuous=continuous,
                 )
             else:
                 # Multi-worker — distribute limit across workers
@@ -766,6 +782,7 @@ def main(limit: int = 1, target_url: str | None = None,
                             headless=headless,
                             model=model,
                             dry_run=dry_run,
+                            continuous=continuous,
                         ): i
                         for i in range(workers)
                     }

@@ -220,8 +220,12 @@ def apply(
         )
         raise typer.Exit(code=1)
 
-    # Check 3: Tailored resumes exist (skip for --gen with --url)
-    if not (gen and url):
+    # Check 3: Tailored resumes exist.
+    # Skipped in continuous mode: that mode exists precisely to wait for work
+    # to appear, and it is started alongside the pipeline (the control panel's
+    # Start button does exactly this). Exiting here would kill the applier
+    # seconds before the pipeline produced anything for it to submit.
+    if not (gen and url) and not continuous:
         conn = get_connection()
         ready = conn.execute(
             "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL AND applied_at IS NULL"
@@ -229,7 +233,8 @@ def apply(
         if ready == 0:
             console.print(
                 "[red]No tailored resumes ready.[/red]\n"
-                "Run [bold]applypilot run score tailor[/bold] first to prepare applications."
+                "Run [bold]applypilot run score tailor[/bold] first to prepare applications,\n"
+                "or use [bold]--continuous[/bold] to wait for them."
             )
             raise typer.Exit(code=1)
 

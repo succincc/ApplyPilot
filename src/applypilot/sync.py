@@ -435,13 +435,43 @@ class SyncDaemon:
         self.start_apply()
 
     def start_apply(self) -> None:
+        """Start the applier alongside the pipeline.
+
+        Runs continuously so it waits for tailored resumes to appear instead
+        of exiting the moment it finds an empty queue — it is launched at the
+        same time as discovery, which takes many minutes to produce anything.
+        The daily cap is still enforced via --limit.
+        """
         if self.apply_proc and self.apply_proc.poll() is None:
             return
+
         min_score = int(self.preset.get("min_score_auto_apply") or 6)
         cap = int(self.preset.get("daily_apply_cap") or 100)
+        workers = int(self.preset.get("apply_workers") or 2)
+
+        # Don't re-apply past the daily cap after a mid-day restart.
+        applied_today = 0
+        try:
+            conn = get_connection()
+            applied_today = conn.execute(
+                "SELECT COUNT(*) FROM jobs WHERE applied_at >= ?",
+                (datetime.now(timezone.utc).date().isoformat(),)).fetchone()[0]
+        except sqlite3.Error:
+            logger.exception("Could not read today's application count")
+
+        remaining_today = max(0, cap - applied_today)
+        if remaining_today == 0:
+            logger.info("Daily apply cap of %d already reached — not starting applier", cap)
+            return
+
+        logger.info("Starting applier: %d remaining of %d daily cap, %d worker(s)",
+                    remaining_today, cap, workers)
         self.apply_proc = subprocess.Popen(
             [sys.executable, "-m", "applypilot", "apply",
-             "--limit", str(cap), "--min-score", str(min_score), "--headless"],
+             "--limit", str(remaining_today),
+             "--min-score", str(min_score),
+             "--workers", str(workers),
+             "--continuous", "--headless"],
         )
 
     def stop_run(self) -> None:
