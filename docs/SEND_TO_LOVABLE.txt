@@ -1,0 +1,175 @@
+================================================================================
+SEND TO LOVABLE — copy everything between the START and END markers
+================================================================================
+
+You do NOT need to open Supabase. Lovable is already connected to your database
+and will run the migration itself.
+
+Paste this as one message into Lovable.
+
+--------------------------------- START -------------------------------------
+
+Two tasks. First a database migration, then a UI feature.
+
+1. DATABASE MIGRATION
+
+Run a migration against the connected Supabase project that adds these columns
+and tables if they don't already exist. Use "if not exists" on everything so it
+is safe to re-run. After creating any new table, enable row level security on it
+and add a policy allowing all operations for the single authenticated user,
+matching the pattern already used by my existing tables.
+
+alter table jobs add column if not exists confirmation_status text;
+alter table jobs add column if not exists confirmed_at timestamptz;
+alter table jobs add column if not exists skip_reason text;
+alter table jobs add column if not exists attention_reason text;
+alter table jobs add column if not exists resume_pdf_path text;
+alter table jobs add column if not exists cover_letter_path text;
+alter table jobs add column if not exists updated_at timestamptz default now();
+alter table search_presets add column if not exists auto_run_hours numeric default 0;
+
+create table if not exists profile (
+  id int primary key default 1 check (id = 1),
+  full_name text, preferred_name text, email text, phone text,
+  address text, city text, province_state text, country text, postal_code text,
+  linkedin_url text, github_url text, portfolio_url text,
+  salary_expectation text, salary_range_min text, salary_range_max text,
+  years_of_experience text, education_level text, target_role text,
+  legally_authorized text, require_sponsorship text,
+  gender text, race_ethnicity text, veteran_status text, disability_status text,
+  resume_text text, updated_at timestamptz default now()
+);
+
+create table if not exists questions (
+  id uuid primary key default gen_random_uuid(),
+  question_normalized text unique not null, question_raw text not null,
+  answer text not null, answer_type text default 'text',
+  confidence text default 'low', times_used int default 0,
+  last_used_at timestamptz, source_job_url text,
+  created_at timestamptz default now()
+);
+
+create table if not exists emails (
+  id uuid primary key default gen_random_uuid(),
+  gmail_id text unique not null, from_address text, subject text,
+  snippet text, body_text text, received_at timestamptz,
+  category text, classified_by text,
+  job_id uuid references jobs(id) on delete set null,
+  is_read boolean default false, created_at timestamptz default now()
+);
+
+create table if not exists target_companies (
+  id uuid primary key default gen_random_uuid(),
+  company text not null, ats text not null, board_token text not null,
+  enabled boolean default true, created_at timestamptz default now()
+);
+
+create table if not exists interview_prep (
+  id uuid primary key default gen_random_uuid(),
+  job_url text unique not null,
+  job_id uuid references jobs(id) on delete cascade,
+  company text, title text, likely_questions text, talking_points text,
+  questions_to_ask text, company_notes text,
+  created_at timestamptz default now()
+);
+
+create table if not exists followups (
+  id uuid primary key default gen_random_uuid(),
+  job_url text unique not null,
+  job_id uuid references jobs(id) on delete cascade,
+  company text, title text, to_address text, subject text, body text,
+  status text default 'draft', days_since int,
+  created_at timestamptz default now()
+);
+
+Also enable Supabase Realtime on the emails table.
+
+2. SUBMISSION VERIFICATION UI
+
+Applications now carry a confirmation_status on the jobs table: 'confirmed'
+(the employer emailed back, so the submission definitely landed), 'pending'
+(applied recently, too early to expect a reply), or 'unconfirmed' (applied over
+48 hours ago with total silence).
+
+- On job cards and in the job detail drawer, show a small status dot on anything
+  with status='applied' or later:
+    green filled  = confirmed   (tooltip: "Employer acknowledged — submission verified")
+    gray hollow   = pending     (tooltip: "Waiting on acknowledgement")
+    amber outline = unconfirmed (tooltip: "No reply after 48h — this submission may not have gone through")
+  In the drawer, show confirmed_at as a relative time when present.
+
+- On the Dashboard, add a "Verified" counter next to the other counters:
+  confirmed divided by total applied, as a percentage, with the raw numbers
+  beneath it.
+
+- On the Analytics page, add a "Confirmation rate by source" horizontal bar
+  chart: for each site with at least 5 applications older than 48 hours, show
+  the percentage with confirmation_status='confirmed'. Sort ascending so the
+  worst source appears first. Color bars under 40% amber.
+
+- Caption that chart exactly: "Some employers never acknowledge applications, so
+  a low number is not proof of failure on its own. Compare sources — if one ATS
+  confirms 80% and another confirms 5%, submissions to the second are probably
+  failing silently."
+
+This app only reads and writes Supabase. It must never scrape job boards, call
+job APIs, or submit applications — a separate local engine does all of that.
+
+---------------------------------- END ---------------------------------------
+
+
+================================================================================
+WHAT TO EXPECT AFTERWARD
+================================================================================
+
+The new screens will look EMPTY and every status dot will be GRAY.
+
+That is correct, not a bug. Those tables are filled by the engine running on
+your PC. The panel is the window; the engine is what puts things in it.
+
+They populate once you have run, on your computer:
+
+    applypilot init      one-time setup: resume, profile, free Gemini API key
+    applypilot doctor    every line should read OK
+    applypilot verify    live-tests the job APIs, your email, and Supabase
+    ./start.sh           starts the bridge; the panel's status pill turns green
+
+Then prove one application end to end before turning up volume:
+
+    applypilot run all
+    applypilot apply --dry-run --limit 1
+
+Drop --dry-run when the form looks right. The confirmation email arriving in
+your inbox is the moment the machine is real.
+
+
+================================================================================
+IMPORTANT: ONE EMAIL ADDRESS
+================================================================================
+
+Two settings must be the SAME address:
+
+  1. personal.email in profile.json   -> typed onto every application form
+  2. MAIL_ADDRESS in .env             -> the inbox scanned for replies
+
+If they differ, employer confirmations arrive at an inbox nothing is watching,
+your Inbox screen stays empty, and nothing links up. 'applypilot doctor' now
+checks this and fails loudly if they disagree.
+
+
+================================================================================
+IF LOVABLE GETS CONFUSED
+================================================================================
+
+Keep follow-up prompts surgical — one problem per message. For example:
+
+  "On the Jobs board the confirmation dots are showing on every job. They should
+   only appear on jobs with status 'applied' or later."
+
+  "The Confirmation rate chart is including sources with fewer than 5
+   applications. Filter those out."
+
+If it starts trying to fetch jobs or build an apply feature, repeat this line:
+
+  "This app only reads and writes Supabase. It must never scrape job boards or
+   submit applications — a separate local engine does that."
