@@ -290,6 +290,9 @@ def mail(
     console.print("\n[bold blue]Scanning inbox...[/bold blue]")
     stats = fetch_and_store(lookback_days=days, limit=limit)
 
+    if stats.get("warning"):
+        console.print(f"\n[bold red]WARNING:[/bold red] {stats['warning']}\n")
+
     if stats.get("error"):
         console.print(f"[red]{stats['error']}[/red]")
         raise typer.Exit(code=1)
@@ -314,6 +317,37 @@ def mail(
 
     if stats["advanced"]:
         console.print(f"\n  [bold]{stats['advanced']}[/bold] application(s) advanced by email")
+
+    # Reconcile what the bot says it submitted against employer acknowledgements
+    from applypilot.mail import reconcile_applications
+    rec = reconcile_applications()
+
+    if rec["total_applied"]:
+        console.print("\n[bold]Submission verification[/bold]")
+        console.print(
+            f"  [green]{rec['confirmed']}[/green] confirmed by employer  "
+            f"[yellow]{rec['pending']}[/yellow] awaiting reply  "
+            f"[red]{rec['unconfirmed']}[/red] unconfirmed after 48h"
+        )
+        console.print(
+            f"  [dim]{rec['confirm_rate']}% of applications got an acknowledgement[/dim]"
+        )
+
+        weak = [s for s in rec["by_site"] if s["rate"] < 40 and s["total"] >= 5]
+        if weak:
+            console.print(
+                "\n  [yellow]Sources with low confirmation rates[/yellow] "
+                "[dim](submissions here may be failing silently)[/dim]"
+            )
+            for s in weak[:5]:
+                console.print(
+                    f"    {s['rate']:>5.1f}%  {s['site'][:40]:<40} "
+                    f"[dim]{s['confirmed']}/{s['total']}[/dim]"
+                )
+            console.print(
+                "    [dim]Note: some employers never acknowledge. Compare "
+                "sources rather than reading any single number as failure.[/dim]"
+            )
     console.print()
 
 
@@ -647,6 +681,19 @@ def doctor() -> None:
     else:
         results.append(("Node.js (npx)", fail_mark,
                         "Install Node.js 18+ from nodejs.org (needed for auto-apply)"))
+
+    # Email: the address on forms must match the mailbox being scanned
+    from applypilot.mail import check_email_alignment
+    mail_addr = os.environ.get("MAIL_ADDRESS")
+    mismatch = check_email_alignment()
+    if mismatch:
+        results.append(("Application email", fail_mark, mismatch))
+    elif mail_addr:
+        results.append(("Application email", ok_mark,
+                        f"{mail_addr} — forms and inbox match"))
+    else:
+        results.append(("Application email", "[dim]optional[/dim]",
+                        "Set MAIL_ADDRESS + MAIL_APP_PASSWORD to track confirmations"))
 
     # CapSolver (optional)
     capsolver = os.environ.get("CAPSOLVER_API_KEY")

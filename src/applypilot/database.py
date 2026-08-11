@@ -186,6 +186,9 @@ _ALL_COLUMNS: dict[str, str] = {
     # Outcome tracking (driven by classified email)
     "outcome": "TEXT",
     "outcome_at": "TEXT",
+    # Independent submission proof (employer's confirmation email)
+    "confirmed_at": "TEXT",
+    "confirmation_status": "TEXT",
 }
 
 

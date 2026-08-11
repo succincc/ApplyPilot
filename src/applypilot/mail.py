@@ -230,15 +230,20 @@ def _tokens(name: str) -> set[str]:
 
 
 def link_to_job(conn: sqlite3.Connection, from_address: str,
-                subject: str, body: str) -> str | None:
+                subject: str, body: str,
+                received_at: str | None = None) -> str | None:
     """Best-effort match of an email to an applied job. Returns a job URL.
 
-    Matches on company-name tokens appearing in the sender, subject, or body,
-    preferring the most recently applied job. Returns None rather than
-    guessing when nothing matches confidently.
+    Matches on company-name tokens in the sender, subject, or body. When the
+    email's arrival time is known, jobs applied to shortly beforehand are
+    preferred: confirmation mail almost always lands within minutes of
+    submission, which makes timing a strong disambiguator when the same
+    company has several open requisitions.
+
+    Returns None rather than guessing when nothing matches confidently.
     """
     rows = conn.execute("""
-        SELECT url, title, site FROM jobs
+        SELECT url, title, site, applied_at FROM jobs
         WHERE applied_at IS NOT NULL
         ORDER BY applied_at DESC
         LIMIT 300
@@ -248,10 +253,36 @@ def link_to_job(conn: sqlite3.Connection, from_address: str,
 
     haystack = f"{from_address or ''} {subject or ''} {(body or '')[:2000]}".lower()
 
-    for row in rows:
-        company_tokens = _tokens(row["site"] or "")
-        if company_tokens and any(t in haystack for t in company_tokens):
-            return row["url"]
+    received = None
+    if received_at:
+        try:
+            received = datetime.fromisoformat(received_at)
+            if received.tzinfo is None:
+                received = received.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            received = None
+
+    def _gap_hours(applied_at: str | None) -> float:
+        """Hours between applying and this email arriving. Large = unrelated."""
+        if received is None or not applied_at:
+            return 1e6
+        try:
+            applied = datetime.fromisoformat(applied_at)
+            if applied.tzinfo is None:
+                applied = applied.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            return 1e6
+        delta = (received - applied).total_seconds() / 3600
+        return delta if delta >= 0 else 1e6  # email predates the application
+
+    company_matches = [
+        row for row in rows
+        if (tokens := _tokens(row["site"] or "")) and any(t in haystack for t in tokens)
+    ]
+    if company_matches:
+        # Closest application in time wins; falls back to most recent when
+        # the email carries no usable timestamp.
+        return min(company_matches, key=lambda r: _gap_hours(r["applied_at"]))["url"]
 
     for row in rows:
         title_tokens = _tokens(row["title"] or "")
@@ -259,6 +290,164 @@ def link_to_job(conn: sqlite3.Connection, from_address: str,
         if len(title_tokens) >= 2 and sum(1 for t in title_tokens if t in haystack) >= 2:
             return row["url"]
 
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Submission verification
+# ---------------------------------------------------------------------------
+
+# An employer's confirmation email is independent proof that a form actually
+# submitted — stronger than the apply agent's own report, which can be wrong
+# if a final page silently rejected the submission.
+CONFIRM_PENDING_HOURS = 3     # too early to draw any conclusion
+CONFIRM_TIMEOUT_HOURS = 48    # past this, no confirmation is a real signal
+
+
+def mark_confirmed(conn: sqlite3.Connection, job_url: str,
+                   received_at: str | None = None) -> bool:
+    """Record that an employer acknowledged this application."""
+    row = conn.execute(
+        "SELECT confirmation_status FROM jobs WHERE url = ?", (job_url,)).fetchone()
+    if row is None or row["confirmation_status"] == "confirmed":
+        return False
+
+    conn.execute("""
+        UPDATE jobs SET confirmation_status = 'confirmed', confirmed_at = ?
+        WHERE url = ?
+    """, (received_at or datetime.now(timezone.utc).isoformat(), job_url))
+    conn.commit()
+    return True
+
+
+def reconcile_applications() -> dict:
+    """Compare what the bot claims it submitted against what employers acknowledged.
+
+    Every application lands in one of three states:
+      confirmed   — the employer emailed back; the submission definitely landed
+      pending     — applied recently; too early to expect a reply
+      unconfirmed — applied over CONFIRM_TIMEOUT_HOURS ago with silence
+
+    'unconfirmed' is a signal, not a verdict: plenty of employers never send an
+    acknowledgement. It becomes meaningful in aggregate — if one ATS confirms
+    90% of the time and another confirms 10%, submissions to the second are
+    probably failing silently, which is exactly the failure the apply agent
+    cannot self-report.
+    """
+    conn = get_connection()
+    ensure_table(conn)
+
+    now = datetime.now(timezone.utc)
+    pending_cutoff = (now - timedelta(hours=CONFIRM_PENDING_HOURS)).isoformat()
+    timeout_cutoff = (now - timedelta(hours=CONFIRM_TIMEOUT_HOURS)).isoformat()
+
+    # Any linked email at all proves the application reached a real system.
+    conn.execute("""
+        UPDATE jobs SET confirmation_status = 'confirmed',
+                        confirmed_at = COALESCE(confirmed_at, (
+                            SELECT MIN(e.received_at) FROM emails e
+                            WHERE e.job_url = jobs.url
+                        ))
+        WHERE applied_at IS NOT NULL
+          AND COALESCE(confirmation_status, '') != 'confirmed'
+          AND EXISTS (SELECT 1 FROM emails e WHERE e.job_url = jobs.url)
+    """)
+
+    conn.execute("""
+        UPDATE jobs SET confirmation_status = 'pending'
+        WHERE applied_at IS NOT NULL
+          AND applied_at > ?
+          AND COALESCE(confirmation_status, '') NOT IN ('confirmed', 'pending')
+    """, (pending_cutoff,))
+
+    conn.execute("""
+        UPDATE jobs SET confirmation_status = 'unconfirmed'
+        WHERE applied_at IS NOT NULL
+          AND applied_at <= ?
+          AND COALESCE(confirmation_status, '') != 'confirmed'
+          AND NOT EXISTS (SELECT 1 FROM emails e WHERE e.job_url = jobs.url)
+    """, (timeout_cutoff,))
+
+    conn.execute("""
+        UPDATE jobs SET confirmation_status = 'pending'
+        WHERE applied_at IS NOT NULL
+          AND applied_at <= ? AND applied_at > ?
+          AND COALESCE(confirmation_status, '') != 'confirmed'
+    """, (pending_cutoff, timeout_cutoff))
+    conn.commit()
+
+    counts = {
+        row[0] or "unknown": row[1]
+        for row in conn.execute("""
+            SELECT confirmation_status, COUNT(*) FROM jobs
+            WHERE applied_at IS NOT NULL GROUP BY confirmation_status
+        """)
+    }
+
+    # Confirmation rate per source — the diagnostic that reveals a site whose
+    # submissions are quietly failing.
+    by_site = []
+    for row in conn.execute("""
+        SELECT site,
+               COUNT(*) AS total,
+               SUM(CASE WHEN confirmation_status = 'confirmed' THEN 1 ELSE 0 END) AS confirmed
+        FROM jobs
+        WHERE applied_at IS NOT NULL AND applied_at <= ?
+        GROUP BY site HAVING total >= 3
+        ORDER BY (confirmed * 1.0 / total) ASC
+    """, (timeout_cutoff,)):
+        by_site.append({
+            "site": row[0] or "unknown",
+            "total": row[1],
+            "confirmed": row[2] or 0,
+            "rate": round(100 * (row[2] or 0) / row[1], 1),
+        })
+
+    total = sum(counts.values())
+    confirmed = counts.get("confirmed", 0)
+    return {
+        "total_applied": total,
+        "confirmed": confirmed,
+        "pending": counts.get("pending", 0),
+        "unconfirmed": counts.get("unconfirmed", 0),
+        "confirm_rate": round(100 * confirmed / total, 1) if total else 0.0,
+        "by_site": by_site,
+    }
+
+
+def check_email_alignment() -> str | None:
+    """Verify the inbox being scanned is the one applications actually use.
+
+    These are two independent settings: `personal.email` in profile.json goes
+    onto every application form, while MAIL_ADDRESS is the mailbox scanned for
+    replies. When they differ, confirmations arrive somewhere nobody is
+    looking, the Inbox stays empty, and nothing ever links — with no error to
+    explain why. Returns a description of the problem, or None when aligned.
+    """
+    config.load_env()
+    scanned = (os.environ.get("MAIL_ADDRESS") or "").strip().lower()
+    if not scanned:
+        return None  # mail ingestion simply not configured yet
+
+    if not config.PROFILE_PATH.exists():
+        return None
+
+    try:
+        profile = config.load_profile()
+    except (OSError, ValueError):
+        return None
+
+    applying = ((profile.get("personal") or {}).get("email") or "").strip().lower()
+    if not applying:
+        return None
+
+    if applying != scanned:
+        return (
+            f"Email mismatch: applications are submitted with '{applying}' but "
+            f"MAIL_ADDRESS scans '{scanned}'. Confirmations and recruiter replies "
+            f"will arrive at '{applying}' where nothing is watching. Make both the "
+            f"same address."
+        )
     return None
 
 
@@ -360,7 +549,8 @@ def fetch_and_store(lookback_days: int = DEFAULT_LOOKBACK_DAYS,
     host = os.environ.get("MAIL_IMAP_HOST", DEFAULT_IMAP_HOST)
 
     stats = {"fetched": 0, "stored": 0, "skipped": 0, "advanced": 0,
-             "by_category": {}, "error": None}
+             "confirmed": 0, "by_category": {}, "error": None,
+             "warning": check_email_alignment()}
 
     if not address or not password:
         stats["error"] = (
@@ -414,7 +604,7 @@ def fetch_and_store(lookback_days: int = DEFAULT_LOOKBACK_DAYS,
                     received = datetime.now(timezone.utc).isoformat()
 
                 category, by = classify(from_addr, subject, body)
-                job_url = link_to_job(conn, from_addr, subject, body)
+                job_url = link_to_job(conn, from_addr, subject, body, received)
 
                 conn.execute("""
                     INSERT OR IGNORE INTO emails
@@ -430,8 +620,12 @@ def fetch_and_store(lookback_days: int = DEFAULT_LOOKBACK_DAYS,
                 stats["stored"] += 1
                 stats["by_category"][category] = stats["by_category"].get(category, 0) + 1
 
-                if job_url and advance_job(conn, job_url, category):
-                    stats["advanced"] += 1
+                if job_url:
+                    # Any reply from the employer proves the form submitted.
+                    if mark_confirmed(conn, job_url, received):
+                        stats["confirmed"] = stats.get("confirmed", 0) + 1
+                    if advance_job(conn, job_url, category):
+                        stats["advanced"] += 1
 
             except Exception:
                 logger.exception("Failed to process message %s", msg_id)

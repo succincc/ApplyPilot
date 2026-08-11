@@ -97,6 +97,10 @@ drop trigger if exists profile_touch on profile;
 create trigger profile_touch before update on profile
   for each row execute function touch_profile();
 
+-- Independent proof a submission actually landed (employer's own email)
+alter table jobs add column if not exists confirmation_status text;
+alter table jobs add column if not exists confirmed_at timestamptz;
+
 -- Interview prep, generated automatically when an interview email lands
 create table if not exists interview_prep (
   id uuid primary key default gen_random_uuid(),
@@ -225,6 +229,38 @@ Then enable **Realtime** on `jobs`, `engine_status`, `commands`, and `emails`.
 >
 > Validation: email must be a valid address, and warn (do not block) if
 > salary_expectation is empty, since it is asked on most applications.
+
+---
+
+## Prompt B3 — submission verification
+
+> Applications carry a `confirmation_status` on the `jobs` table:
+> `confirmed` (the employer emailed back — the submission definitely landed),
+> `pending` (applied recently, too early to expect a reply), or `unconfirmed`
+> (applied over 48 hours ago with total silence).
+>
+> **On job cards and the job detail drawer**, show a small status dot next to
+> anything with `status='applied'` or later: green filled = confirmed (tooltip
+> "Employer acknowledged — submission verified"), gray hollow = pending
+> ("Waiting on acknowledgement"), amber outline = unconfirmed ("No reply after
+> 48h — this submission may not have gone through"). In the drawer, show
+> `confirmed_at` as a relative time when present.
+>
+> **On the Dashboard**, add a "Verified" counter beside the outcome counters:
+> `confirmed / total applied` as a percentage, with the raw numbers beneath.
+>
+> **On the Analytics page**, add a **Confirmation rate by source** horizontal
+> bar chart: for each `site` with at least 5 applications older than 48 hours,
+> the percentage with `confirmation_status='confirmed'`. Sort ascending so the
+> worst appears first, and color bars under 40% amber.
+>
+> Caption it exactly: "Some employers never acknowledge applications, so a low
+> number is not proof of failure on its own. Compare sources — if one ATS
+> confirms 80% and another confirms 5%, submissions to the second are probably
+> failing silently."
+>
+> This is the one place the system can catch itself being wrong: the apply
+> agent reports its own success, but an employer's email is independent proof.
 
 ---
 

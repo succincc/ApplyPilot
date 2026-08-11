@@ -396,6 +396,13 @@ class SyncDaemon:
                 "No LLM API key — set GEMINI_API_KEY in ~/.applypilot/.env "
                 "(free at aistudio.google.com)")
 
+        # Applying with one address while watching another means every
+        # confirmation and recruiter reply is invisible.
+        from applypilot.mail import check_email_alignment
+        mismatch = check_email_alignment()
+        if mismatch:
+            problems.append(mismatch)
+
         return problems
 
     def report_blocked(self, problems: list[str]) -> None:
@@ -494,6 +501,8 @@ class SyncDaemon:
                 "attention_reason": attention,
                 "skip_reason": row.get("apply_error") if status in ("failed", "needs_attention") else None,
                 "applied_at": row.get("applied_at"),
+                "confirmation_status": row.get("confirmation_status"),
+                "confirmed_at": row.get("confirmed_at"),
                 "discovered_at": row.get("discovered_at"),
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
@@ -911,9 +920,16 @@ class SyncDaemon:
             return
 
         stats = mail_mod.fetch_and_store(lookback_days=14, limit=100)
+        if stats.get("warning"):
+            logger.error("MAIL CONFIG: %s", stats["warning"])
         if stats.get("error"):
             logger.warning("Mail ingest: %s", stats["error"])
             return
+
+        try:
+            mail_mod.reconcile_applications()
+        except Exception:
+            logger.exception("Application reconciliation failed")
         if stats["stored"]:
             logger.info("Mail: %d new job-related (%s)",
                         stats["stored"], stats["by_category"])
