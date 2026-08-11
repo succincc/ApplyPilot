@@ -41,15 +41,20 @@ DEFAULT_DAILY_BUDGET = 1400
 # order; a stage may exceed its share only if later stages' reservations are
 # still intact. Tailoring and applying outrank scoring because they convert
 # directly into submitted applications.
-# Shares are sized from real per-day consumption at ~100 applications:
-# scoring runs once per DISCOVERED job (by far the largest consumer), while
-# tailoring and cover letters run only for jobs that clear the threshold.
-# The apply stage's share is small because form-filling runs on Claude Code,
-# not on this quota. Shares must sum to 1.0.
+# Shares are sized for maximum applications per day.
+#
+# Scoring used to dominate this budget at one request per discovered job.
+# Batched scoring (15 jobs per request) plus the free rule-based prefilter
+# cut that by roughly 20x, so scoring now needs a small slice to triage
+# thousands of jobs — and the freed quota goes to tailoring, which is what
+# actually converts a job into a submitted application.
+#
+# The apply share is small because form-filling runs on Claude Code, not on
+# this quota. Shares must sum to 1.0.
 STAGE_RESERVATIONS: dict[str, float] = {
-    "score": 0.48,   # ~1 request per discovered job — the bulk of the spend
-    "tailor": 0.20,  # per job above threshold, retried on validation failure
-    "cover": 0.14,   # per job above threshold
+    "tailor": 0.50,  # one resume per application — now the throughput cap
+    "cover": 0.20,   # only for high-scoring jobs by default (COVER_LETTER_MODE)
+    "score": 0.12,   # batched 15:1, so this triages thousands of jobs
     "enrich": 0.08,  # AI description extraction for unknown page layouts
     "coach": 0.04,   # interview prep + follow-up drafts (rare, high value)
     "mail": 0.03,    # ambiguous email classification only

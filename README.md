@@ -175,6 +175,7 @@ applypilot mail      # fetch + classify job email on demand
 | [docs/GO_LIVE.md](docs/GO_LIVE.md) | Setup order and the dry-run proof |
 | [docs/HARDENING.md](docs/HARDENING.md) | Seed data, smoke test, hardening prompts |
 | [docs/COST.md](docs/COST.md) | Why it stays $0 — and the one button never to click |
+| [docs/VOLUME.md](docs/VOLUME.md) | How to sustain hundreds of applications per day |
 
 Everything runs on free tiers. Nothing in the stack can paywall you, throttle
 you, or read your data.

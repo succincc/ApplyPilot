@@ -150,11 +150,39 @@ def _run_tailor(min_score: int = 7, validation_mode: str = "normal") -> dict:
 
 
 def _run_cover(min_score: int = 7, validation_mode: str = "normal") -> dict:
-    """Stage: Cover letter generation."""
+    """Stage: Cover letter generation.
+
+    COVER_LETTER_MODE controls how much quota this stage consumes:
+      all  — every job above the apply threshold (highest quality)
+      high — only jobs scoring COVER_LETTER_MIN_SCORE or better (default)
+      off  — none; the apply agent writes two factual sentences inline on the
+             rare form that requires one
+
+    Most ATS forms never ask for a cover letter, so generating one for every
+    job spends a large share of the daily budget on documents nobody reads.
+    On 'high' that quota goes to tailoring instead, which raises the ceiling
+    on applications per day.
+    """
+    import os
+
+    mode = os.environ.get("COVER_LETTER_MODE", "high").lower()
+    if mode == "off":
+        console.print("  [dim]Cover letters disabled (COVER_LETTER_MODE=off)[/dim]")
+        return {"status": "skipped", "mode": "off"}
+
+    threshold = min_score
+    if mode == "high":
+        try:
+            threshold = max(min_score, int(os.environ.get("COVER_LETTER_MIN_SCORE", "8")))
+        except ValueError:
+            threshold = max(min_score, 8)
+        console.print(f"  [dim]Cover letters for score >= {threshold} "
+                      f"(COVER_LETTER_MODE=high)[/dim]")
+
     try:
         from applypilot.scoring.cover_letter import run_cover_letters
-        run_cover_letters(min_score=min_score, validation_mode=validation_mode)
-        return {"status": "ok"}
+        run_cover_letters(min_score=threshold, validation_mode=validation_mode)
+        return {"status": "ok", "mode": mode, "min_score": threshold}
     except Exception as e:
         log.error("Cover letter generation failed: %s", e)
         return {"status": f"error: {e}"}

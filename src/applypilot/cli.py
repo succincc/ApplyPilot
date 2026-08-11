@@ -97,9 +97,30 @@ def run(
             "lenient: banned words ignored, LLM judge skipped (fastest, fewest API calls)."
         ),
     ),
+    volume: bool = typer.Option(
+        False, "--volume",
+        help="Maximum applications per day: lenient validation, larger score "
+             "batches, cover letters only for top matches.",
+    ),
 ) -> None:
     """Run pipeline stages: discover, enrich, score, tailor, cover, pdf."""
     _bootstrap()
+
+    if volume:
+        # Every throughput lever at once. Each of these trades a little
+        # polish for a lot of submitted applications:
+        #   lenient      -> no LLM judge, far fewer tailoring retries
+        #   batch 20     -> ~20 jobs triaged per scoring request
+        #   cover high   -> cover letters only where they might matter
+        import os
+        validation = "lenient"
+        os.environ.setdefault("SCORE_BATCH_SIZE", "20")
+        os.environ.setdefault("COVER_LETTER_MODE", "high")
+        os.environ.setdefault("COVER_LETTER_MIN_SCORE", "8")
+        console.print(
+            "[bold yellow]Volume mode[/bold yellow] — lenient validation, "
+            "batch-20 scoring, cover letters for score 8+ only\n"
+        )
 
     from applypilot.pipeline import run_pipeline
 

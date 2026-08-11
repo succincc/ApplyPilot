@@ -257,6 +257,65 @@ def no_go_ok(title: str | None, description: str | None,
 # Combined gate
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Free pre-scoring triage
+# ---------------------------------------------------------------------------
+
+# Seniority markers that mean a posting is out of range in either direction.
+_TOO_SENIOR = (
+    "vice president", "vp of", "chief ", "head of", "director of",
+    "senior director", "principal architect", "distinguished engineer",
+    "svp", "evp", "c-level", "cto", "cio", "ceo",
+)
+_TOO_JUNIOR = (
+    "intern", "internship", "co-op", "coop program", "apprentice",
+    "trainee", "student", "entry level only", "high school",
+)
+# Hard blockers no amount of fit can overcome.
+_HARD_BLOCKERS = (
+    "active security clearance", "ts/sci", "top secret clearance",
+    "polygraph", "must have clearance", "secret clearance required",
+)
+
+
+def prescore(job: dict, profile_years: int | None = None) -> tuple[bool, str | None]:
+    """Rule-based triage run BEFORE any LLM request. Free.
+
+    Returns (worth_scoring, reason_if_not). This exists purely for volume:
+    every job rejected here is a free-tier request that goes to tailoring
+    instead of being spent proving a mismatch the title already made obvious.
+
+    Deliberately conservative — it only rejects what is unambiguous. Anything
+    debatable passes through to the AI scorer, because the volume doctrine
+    says uncertainty gets an application, not a filter.
+    """
+    title = (job.get("title") or "").lower()
+    description = (job.get("full_description") or job.get("description") or "").lower()
+
+    if not title:
+        return True, None
+
+    for marker in _TOO_SENIOR:
+        if marker in title:
+            return False, f"seniority mismatch: {marker}"
+
+    for marker in _TOO_JUNIOR:
+        if re.search(rf"(?<!\w){re.escape(marker)}(?!\w)", title):
+            return False, f"level mismatch: {marker}"
+
+    blob = f"{title}\n{description[:3000]}"
+    for blocker in _HARD_BLOCKERS:
+        if blocker in blob:
+            return False, f"hard requirement: {blocker}"
+
+    # A posting with no description at all cannot be scored meaningfully;
+    # enrichment will fill it in on a later pass.
+    if not description.strip():
+        return False, "no description yet"
+
+    return True, None
+
+
 def job_passes(job: dict, filters: dict) -> tuple[bool, str | None]:
     """Run every filter against one job.
 
