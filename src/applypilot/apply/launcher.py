@@ -456,6 +456,12 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         job_log = config.LOG_DIR / f"claude_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"
         job_log.write_text(output, encoding="utf-8")
 
+        # Harvest screening Q&A pairs into the question bank (never fatal)
+        from applypilot import questions as questions_mod
+        logged = questions_mod.parse_qlog(output, source_job_url=job["url"])
+        if logged:
+            add_event(f"[W{worker_id}] Logged {logged} screening answer(s)")
+
         if stats:
             cost = stats.get("cost_usd", 0)
             ws = get_state(worker_id)

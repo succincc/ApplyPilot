@@ -180,6 +180,9 @@ _ALL_COLUMNS: dict[str, str] = {
     "apply_duration_ms": "INTEGER",
     "apply_task_id": "TEXT",
     "verification_confidence": "TEXT",
+    # Panel sync (Mission Control bridge)
+    "panel_approved": "INTEGER DEFAULT 0",
+    "original_fit_score": "INTEGER",
 }
 
 

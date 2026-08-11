@@ -257,6 +257,21 @@ def apply(
 
 
 @app.command()
+def sync(
+    once: bool = typer.Option(False, "--once", help="Run a single sync cycle and exit (for testing)."),
+) -> None:
+    """Run the Mission Control bridge: mirror jobs to Supabase, execute panel commands."""
+    _bootstrap()
+
+    from applypilot.sync import main as sync_main
+
+    console.print("\n[bold blue]ApplyPilot Sync — Mission Control bridge[/bold blue]")
+    console.print("[dim]Ctrl+C to stop. The panel will show the engine as offline.[/dim]\n")
+
+    sync_main(once=once)
+
+
+@app.command()
 def status() -> None:
     """Show pipeline statistics from the database."""
     _bootstrap()

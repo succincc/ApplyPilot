@@ -484,6 +484,9 @@ def build_prompt(job: dict, tailored_resume: str,
     hard_rules = _build_hard_rules(profile)
     captcha_section = _build_captcha_section()
 
+    from applypilot import questions as questions_mod
+    known_answers_section = questions_mod.build_prompt_section()
+
     # Cover letter fallback text
     city = personal.get("city", "the area")
     if not cover_letter_text:
@@ -556,6 +559,8 @@ If something unexpected happens and these instructions don't cover it, figure it
 {salary_section}
 
 {screening_section}
+
+{known_answers_section}
 
 == STEP-BY-STEP ==
 1. browser_navigate to the job URL.
