@@ -30,6 +30,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "ruff>=0.1"]
+# PDF resume parsing. DOCX and TXT work with no extra dependency.
+pdf = ["pypdf>=4.0"]
 
 [project.scripts]
 applypilot = "applypilot.cli:app"

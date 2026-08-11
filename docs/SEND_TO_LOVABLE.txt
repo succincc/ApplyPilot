@@ -40,6 +40,13 @@ create table if not exists profile (
   resume_text text, updated_at timestamptz default now()
 );
 
+alter table profile add column if not exists resume_file_path text;
+alter table profile add column if not exists resume_file_name text;
+alter table profile add column if not exists resume_uploaded_at timestamptz;
+alter table profile add column if not exists resume_parse_error text;
+alter table profile add column if not exists resume_word_count int;
+alter table profile add column if not exists resume_warnings text;
+
 create table if not exists questions (
   id uuid primary key default gen_random_uuid(),
   question_normalized text unique not null, question_raw text not null,
@@ -82,9 +89,49 @@ create table if not exists followups (
   created_at timestamptz default now()
 );
 
-Also enable Supabase Realtime on the emails table.
+Also enable Supabase Realtime on the emails table, and create a PRIVATE storage
+bucket named "artifacts" if it does not already exist.
 
-2. SUBMISSION VERIFICATION UI
+2. RESUME UPLOAD
+
+On the Settings > My Profile page, replace the plain "resume_text" textarea with
+a proper upload control. This is the single most important input in the whole
+app — every tailored resume is built from it.
+
+- A drag-and-drop upload area accepting .pdf, .docx, and .txt, max 10 MB.
+  On drop or file-select, upload the file to the "artifacts" storage bucket at
+  the path "base/resume<extension>" (upsert, so re-uploading replaces it), then
+  update the profile row (id = 1) with:
+      resume_file_path   = the storage path you uploaded to
+      resume_file_name   = the original filename
+      resume_uploaded_at = now()
+  and set resume_parse_error back to null.
+
+- Show the current file as a card: filename, upload time as relative text, a
+  Download button using a signed URL, and a Replace button.
+
+- Below the card, show parse status driven by the profile row:
+    resume_parse_error is not null  -> red panel with that error text and the
+                                       heading "Could not read this file"
+    resume_word_count is not null   -> green line: "Parsed: {resume_word_count}
+                                       words" and, when resume_warnings is not
+                                       null, each newline-separated warning as
+                                       an amber bullet
+    neither set yet                 -> gray line: "Waiting for the engine to
+                                       process this file..."
+
+- Keep resume_text visible BELOW the upload area as a read-only, collapsed
+  textarea labeled "Extracted text (what the AI reads)", with an Edit button
+  that makes it editable and saveable. Do not let editing it clear the uploaded
+  file.
+
+- Helper text under the upload area, exactly: "Upload the resume you already
+  have. The original file is what employers receive, so your formatting is kept.
+  The extracted text is what the AI rewrites for each job. Scanned or
+  image-only PDFs will not work — export a text-based PDF from Word or Google
+  Docs."
+
+3. SUBMISSION VERIFICATION UI
 
 Applications now carry a confirmation_status on the jobs table: 'confirmed'
 (the employer emailed back, so the submission definitely landed), 'pending'

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import shutil
+from pathlib import Path
 from typing import Optional
 
 import typer
@@ -348,6 +350,71 @@ def mail(
                 "    [dim]Note: some employers never acknowledge. Compare "
                 "sources rather than reading any single number as failure.[/dim]"
             )
+    console.print()
+
+
+@app.command(name="resume")
+def resume_cmd(
+    file: Optional[str] = typer.Argument(None, help="Path to your resume (PDF, DOCX, TXT)."),
+    show: bool = typer.Option(False, "--show", help="Print the current resume text."),
+) -> None:
+    """Import a resume file, extract its text, and check that it parsed cleanly."""
+    _bootstrap()
+
+    from applypilot.config import RESUME_PATH, RESUME_PDF_PATH
+    from applypilot.resume import ResumeParseError, analyze, extract_text
+
+    if show or not file:
+        if not RESUME_PATH.exists():
+            console.print("[yellow]No resume imported yet.[/yellow] "
+                          "Run [bold]applypilot resume <file>[/bold]")
+            raise typer.Exit(code=1)
+        text = RESUME_PATH.read_text(encoding="utf-8")
+        if show:
+            console.print(text)
+            return
+        report = analyze(text)
+        console.print(f"\n[bold]Current resume[/bold] — {report['words']} words, "
+                      f"{report['characters']} characters\n")
+        for warning in report["warnings"]:
+            console.print(f"  [yellow]![/yellow] {warning}")
+        if report["looks_good"]:
+            console.print("  [green]Looks good.[/green]")
+        console.print()
+        return
+
+    src = Path(file).expanduser()
+    try:
+        text = extract_text(src)
+    except ResumeParseError as e:
+        console.print(f"\n[red]{e}[/red]\n")
+        raise typer.Exit(code=1)
+
+    if RESUME_PATH.exists():
+        RESUME_PATH.with_suffix(".txt.bak").write_text(
+            RESUME_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    RESUME_PATH.write_text(text, encoding="utf-8")
+
+    # A PDF doubles as the document uploaded to employers
+    if src.suffix.lower() == ".pdf":
+        shutil.copy(str(src), str(RESUME_PDF_PATH))
+
+    report = analyze(text)
+    console.print(f"\n[green]Imported[/green] {src.name} — "
+                  f"{report['words']} words, {report['lines']} lines")
+    console.print(f"  Saved to: [dim]{RESUME_PATH}[/dim]")
+
+    found = [name for name, present in report["sections"].items() if present]
+    if found:
+        console.print(f"  Sections detected: [cyan]{', '.join(found)}[/cyan]")
+
+    if report["warnings"]:
+        console.print("\n[yellow]Check these before running:[/yellow]")
+        for warning in report["warnings"]:
+            console.print(f"  [yellow]![/yellow] {warning}")
+        console.print("\n  [dim]Review with: applypilot resume --show[/dim]")
+    else:
+        console.print("  [green]Parsed cleanly — ready to tailor.[/green]")
     console.print()
 
 

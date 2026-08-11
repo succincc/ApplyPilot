@@ -161,6 +161,7 @@ the engine keeps running on your own machine (home IP + real Chrome is the
 lowest-detection setup there is). They communicate only through Supabase.
 
 ```bash
+applypilot resume my_resume.pdf   # import a resume; checks it parsed cleanly
 applypilot verify    # live-test every job API, your mail, and Supabase
 applypilot sync      # bridge: panel goes live, Start button works
 applypilot mail      # fetch + classify job email on demand

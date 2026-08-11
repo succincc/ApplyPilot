@@ -845,6 +845,11 @@ class SyncDaemon:
                 json.dumps(profile, indent=2, ensure_ascii=False), encoding="utf-8")
             logger.info("Profile updated from panel: %s", ", ".join(changed))
 
+        # Resume FILE uploaded in the panel takes priority over pasted text:
+        # it is the real document, and it also becomes what gets uploaded to
+        # employers, so formatting survives.
+        self._pull_resume_file(row)
+
         # Resume text edited in the panel
         resume_text = row.get("resume_text")
         if resume_text and resume_text.strip():
@@ -859,6 +864,72 @@ class SyncDaemon:
 
         if remote_updated:
             marker.write_text(str(remote_updated), encoding="utf-8")
+
+    def _pull_resume_file(self, row: dict) -> None:
+        """Download a resume uploaded in the panel, extract its text, install it.
+
+        The original file is kept as the document uploaded to employers, so
+        the user's real formatting survives. The extracted text is what the
+        scorer reads and the tailoring stage rewrites per job.
+        """
+        storage_path = row.get("resume_file_path")
+        if not storage_path:
+            return
+
+        marker = config.APP_DIR / ".resume_file_sync"
+        stamp = f"{storage_path}|{row.get('resume_uploaded_at') or ''}"
+        if marker.exists() and marker.read_text(encoding="utf-8").strip() == stamp:
+            return
+
+        try:
+            r = self.sb.client.get(f"{self.sb.storage}/object/artifacts/{storage_path}")
+            r.raise_for_status()
+            data = r.content
+        except httpx.HTTPError as e:
+            logger.warning("Could not download uploaded resume (%s): %s", storage_path, e)
+            return
+
+        suffix = Path(storage_path).suffix.lower() or ".pdf"
+        dest = config.APP_DIR / f"resume_upload{suffix}"
+        dest.write_bytes(data)
+
+        from applypilot.resume import ResumeParseError, analyze, extract_text
+        try:
+            text = extract_text(dest)
+        except ResumeParseError as e:
+            logger.error("Uploaded resume could not be parsed: %s", e)
+            try:
+                self.sb.update("profile", "id=eq.1",
+                               {"resume_parse_error": str(e), "resume_text": None})
+            except httpx.HTTPError:
+                pass
+            return
+
+        # Back up whatever was there before replacing it
+        if config.RESUME_PATH.exists():
+            config.RESUME_PATH.with_suffix(".txt.bak").write_text(
+                config.RESUME_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+        config.RESUME_PATH.write_text(text, encoding="utf-8")
+
+        # A PDF upload doubles as the document sent to employers
+        if suffix == ".pdf":
+            config.RESUME_PDF_PATH.write_bytes(data)
+
+        report = analyze(text)
+        try:
+            self.sb.update("profile", "id=eq.1", {
+                "resume_text": text,
+                "resume_parse_error": None,
+                "resume_word_count": report["words"],
+                "resume_warnings": "\n".join(report["warnings"]) or None,
+            })
+        except httpx.HTTPError:
+            pass
+
+        marker.write_text(stamp, encoding="utf-8")
+        logger.info("Installed uploaded resume: %s (%d words)%s",
+                    storage_path, report["words"],
+                    "" if report["looks_good"] else f" — {len(report['warnings'])} warning(s)")
 
     def push_profile(self) -> None:
         """Seed the panel's profile row from profile.json on first run."""
