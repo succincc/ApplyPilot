@@ -465,7 +465,7 @@ def extract_with_llm(page, url: str) -> dict:
     try:
         client = get_client()
         t0 = time.time()
-        raw = client.ask(prompt, temperature=0.0, max_tokens=4096)
+        raw = client.ask_for("enrich", prompt, temperature=0.0, max_tokens=4096)
         elapsed = time.time() - t0
         log.info("LLM: %d chars in, %.1fs", len(prompt), elapsed)
 

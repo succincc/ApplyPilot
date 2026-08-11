@@ -92,10 +92,16 @@ def score_job(resume_text: str, job: dict) -> dict:
         {"role": "user", "content": f"RESUME:\n{resume_text}\n\n---\n\nJOB POSTING:\n{job_text}"},
     ]
 
+    from applypilot.budget import BudgetExhausted
+
     try:
         client = get_client()
-        response = client.chat(messages, max_tokens=512, temperature=0.2)
+        response = client.chat(messages, max_tokens=512, temperature=0.2, stage="score")
         return _parse_score_response(response)
+    except BudgetExhausted:
+        # Must propagate: writing a 0 here would permanently mark the job as
+        # a bad fit when the only problem is that today's quota ran out.
+        raise
     except Exception as e:
         log.error("LLM error scoring job '%s': %s", job.get("title", "?"), e)
         return {"score": 0, "keywords": "", "reasoning": f"LLM error: {e}"}
@@ -137,8 +143,23 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     errors = 0
     results: list[dict] = []
 
+    from applypilot.budget import BudgetExhausted
+
+    budget_stopped = False
     for job in jobs:
-        result = score_job(resume_text, job)
+        try:
+            result = score_job(resume_text, job)
+        except BudgetExhausted as e:
+            # Stop cleanly and keep whatever was scored so far. Unscored jobs
+            # stay unscored and are picked up on the next run.
+            log.warning("%s", e)
+            log.warning(
+                "Stopping scoring after %d of %d jobs. The rest keep their "
+                "unscored state and will be scored on the next run.",
+                completed, len(jobs))
+            budget_stopped = True
+            break
+
         result["url"] = job["url"]
         completed += 1
 
@@ -177,4 +198,5 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
         "errors": errors,
         "elapsed": elapsed,
         "distribution": distribution,
+        "budget_stopped": budget_stopped,
     }

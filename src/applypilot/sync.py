@@ -213,6 +213,11 @@ class SyncDaemon:
                 "SELECT COUNT(*) FROM jobs WHERE apply_status IN ('manual','captcha','login_issue')"
                 " OR apply_error LIKE '%captcha%' OR apply_error LIKE '%login%'"
                 " OR apply_error LIKE '%sso%'").fetchone()[0]
+            from applypilot import budget
+            b = budget.summary()
+            counters["ai_used_today"] = b["used"]
+            counters["ai_remaining"] = b["remaining"]
+            counters["ai_percent_used"] = b["percent_used"]
         except sqlite3.Error:
             logger.exception("Counter query failed")
 
@@ -636,6 +641,151 @@ class SyncDaemon:
             self.sb.upsert("questions", push, on_conflict="question_normalized")
             logger.info("Pushed %d new question(s) to panel", len(push))
 
+    # -- profile + resume from the panel ------------------------------------
+
+    def sync_profile(self) -> None:
+        """Pull profile fields and resume text edited in the panel.
+
+        The panel is the editing surface; profile.json on disk stays the
+        engine's source of truth. Only fields actually present in the cloud
+        row are applied, so a partially-filled panel form never blanks out
+        data set during `applypilot init`.
+        """
+        try:
+            rows = self.sb.select("profile", "limit=1")
+        except httpx.HTTPError:
+            return
+        if not rows:
+            return
+
+        row = rows[0]
+        remote_updated = row.get("updated_at")
+
+        # Skip when nothing changed since the last pull
+        marker = config.APP_DIR / ".profile_sync"
+        if remote_updated and marker.exists():
+            if marker.read_text(encoding="utf-8").strip() == str(remote_updated):
+                return
+
+        if not config.PROFILE_PATH.exists():
+            logger.warning("Panel profile received but no local profile.json — "
+                           "run 'applypilot init' first so defaults exist")
+            return
+
+        profile = config.load_profile()
+        changed = []
+
+        # Map flat panel columns onto the nested profile structure
+        field_map = {
+            "full_name": ("personal", "full_name"),
+            "preferred_name": ("personal", "preferred_name"),
+            "email": ("personal", "email"),
+            "phone": ("personal", "phone"),
+            "address": ("personal", "address"),
+            "city": ("personal", "city"),
+            "province_state": ("personal", "province_state"),
+            "country": ("personal", "country"),
+            "postal_code": ("personal", "postal_code"),
+            "linkedin_url": ("personal", "linkedin_url"),
+            "github_url": ("personal", "github_url"),
+            "portfolio_url": ("personal", "portfolio_url"),
+            "salary_expectation": ("compensation", "salary_expectation"),
+            "salary_range_min": ("compensation", "salary_range_min"),
+            "salary_range_max": ("compensation", "salary_range_max"),
+            "years_of_experience": ("experience", "years_of_experience_total"),
+            "education_level": ("experience", "education_level"),
+            "target_role": ("experience", "target_role"),
+            "legally_authorized": ("work_authorization", "legally_authorized_to_work"),
+            "require_sponsorship": ("work_authorization", "require_sponsorship"),
+            "gender": ("eeo_voluntary", "gender"),
+            "race_ethnicity": ("eeo_voluntary", "race_ethnicity"),
+            "veteran_status": ("eeo_voluntary", "veteran_status"),
+            "disability_status": ("eeo_voluntary", "disability_status"),
+        }
+
+        for column, (section, key) in field_map.items():
+            value = row.get(column)
+            if value in (None, ""):
+                continue
+            value = str(value)
+            profile.setdefault(section, {})
+            if profile[section].get(key) != value:
+                profile[section][key] = value
+                changed.append(key)
+
+        if changed:
+            backup = config.PROFILE_PATH.with_suffix(".json.bak")
+            backup.write_text(config.PROFILE_PATH.read_text(encoding="utf-8"),
+                              encoding="utf-8")
+            config.PROFILE_PATH.write_text(
+                json.dumps(profile, indent=2, ensure_ascii=False), encoding="utf-8")
+            logger.info("Profile updated from panel: %s", ", ".join(changed))
+
+        # Resume text edited in the panel
+        resume_text = row.get("resume_text")
+        if resume_text and resume_text.strip():
+            current = (config.RESUME_PATH.read_text(encoding="utf-8")
+                       if config.RESUME_PATH.exists() else "")
+            if current.strip() != resume_text.strip():
+                if current:
+                    config.RESUME_PATH.with_suffix(".txt.bak").write_text(
+                        current, encoding="utf-8")
+                config.RESUME_PATH.write_text(resume_text, encoding="utf-8")
+                logger.info("Resume updated from panel (%d chars)", len(resume_text))
+
+        if remote_updated:
+            marker.write_text(str(remote_updated), encoding="utf-8")
+
+    def push_profile(self) -> None:
+        """Seed the panel's profile row from profile.json on first run."""
+        if not config.PROFILE_PATH.exists():
+            return
+        try:
+            if self.sb.select("profile", "limit=1"):
+                return  # panel already has a row; it owns edits from here
+        except httpx.HTTPError:
+            return
+
+        p = config.load_profile()
+        personal = p.get("personal") or {}
+        comp = p.get("compensation") or {}
+        exp = p.get("experience") or {}
+        auth = p.get("work_authorization") or {}
+        eeo = p.get("eeo_voluntary") or {}
+
+        resume_text = (config.RESUME_PATH.read_text(encoding="utf-8")
+                       if config.RESUME_PATH.exists() else None)
+
+        self.sb.upsert("profile", [{
+            "id": 1,
+            "full_name": personal.get("full_name"),
+            "preferred_name": personal.get("preferred_name"),
+            "email": personal.get("email"),
+            "phone": personal.get("phone"),
+            "address": personal.get("address"),
+            "city": personal.get("city"),
+            "province_state": personal.get("province_state"),
+            "country": personal.get("country"),
+            "postal_code": personal.get("postal_code"),
+            "linkedin_url": personal.get("linkedin_url"),
+            "github_url": personal.get("github_url"),
+            "portfolio_url": personal.get("portfolio_url"),
+            "salary_expectation": comp.get("salary_expectation"),
+            "salary_range_min": comp.get("salary_range_min"),
+            "salary_range_max": comp.get("salary_range_max"),
+            "years_of_experience": exp.get("years_of_experience_total"),
+            "education_level": exp.get("education_level"),
+            "target_role": exp.get("target_role"),
+            "legally_authorized": auth.get("legally_authorized_to_work"),
+            "require_sponsorship": auth.get("require_sponsorship"),
+            "gender": eeo.get("gender"),
+            "race_ethnicity": eeo.get("race_ethnicity"),
+            "veteran_status": eeo.get("veteran_status"),
+            "disability_status": eeo.get("disability_status"),
+            "resume_text": resume_text,
+        }], on_conflict="id")
+        logger.info("Seeded panel profile from profile.json")
+
     # -- email ingest + push ------------------------------------------------
 
     def sync_mail(self) -> None:
@@ -717,11 +867,15 @@ class SyncDaemon:
     # -- main loop ---------------------------------------------------------
 
     def loop(self, once: bool = False) -> None:
-        # Load the active preset so thresholds are right from the start
+        # Load the active preset so thresholds are right from the start, and
+        # seed the panel's profile row if this is the first connection.
         try:
             self.preset = self.fetch_preset(None)
+            self.push_profile()
         except httpx.HTTPError:
-            logger.warning("Could not fetch active preset (using defaults)")
+            logger.warning("Could not reach Supabase on startup (will retry)")
+        except Exception:
+            logger.exception("Startup sync failed (continuing)")
 
         logger.info("Sync daemon started (heartbeat %ss, commands %ss, mirror %ss)",
                     HEARTBEAT_INTERVAL, COMMAND_INTERVAL, MIRROR_INTERVAL)
@@ -736,6 +890,7 @@ class SyncDaemon:
                     self.poll_commands()
                     self._last["commands"] = now
                 if now - self._last["mirror"] >= MIRROR_INTERVAL:
+                    self.sync_profile()
                     self.pull_decisions()
                     self.mirror_jobs()
                     self.sync_questions()

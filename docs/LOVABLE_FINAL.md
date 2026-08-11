@@ -72,6 +72,31 @@ create table if not exists target_companies (
   created_at timestamptz default now()
 );
 
+-- Your identity: what goes on every application form.
+-- Single row (id = 1). The engine seeds it from profile.json on first
+-- connection, then the panel becomes the place you edit it.
+create table if not exists profile (
+  id int primary key default 1 check (id = 1),
+  full_name text, preferred_name text,
+  email text, phone text,
+  address text, city text, province_state text, country text, postal_code text,
+  linkedin_url text, github_url text, portfolio_url text,
+  salary_expectation text, salary_range_min text, salary_range_max text,
+  years_of_experience text, education_level text, target_role text,
+  legally_authorized text, require_sponsorship text,
+  gender text, race_ethnicity text, veteran_status text, disability_status text,
+  resume_text text,
+  updated_at timestamptz default now()
+);
+
+-- Keep updated_at fresh so the engine knows when to pull changes
+create or replace function touch_profile() returns trigger as $$
+begin new.updated_at = now(); return new; end;
+$$ language plpgsql;
+drop trigger if exists profile_touch on profile;
+create trigger profile_touch before update on profile
+  for each row execute function touch_profile();
+
 -- Indexes that matter once you have thousands of rows
 create index if not exists idx_jobs_status on jobs(status);
 create index if not exists idx_jobs_applied_at on jobs(applied_at desc);
@@ -83,15 +108,17 @@ alter table questions enable row level security;
 alter table emails enable row level security;
 alter table target_companies enable row level security;
 
+alter table profile enable row level security;
+
 do $$
-declare uid text := 'YOUR-AUTH-USER-UUID';
+declare
+  uid text := 'YOUR-AUTH-USER-UUID';
+  t text;
 begin
-  execute format('drop policy if exists owner_all on questions');
-  execute format('create policy owner_all on questions for all using (auth.uid() = %L)', uid);
-  execute format('drop policy if exists owner_all on emails');
-  execute format('create policy owner_all on emails for all using (auth.uid() = %L)', uid);
-  execute format('drop policy if exists owner_all on target_companies');
-  execute format('create policy owner_all on target_companies for all using (auth.uid() = %L)', uid);
+  foreach t in array array['questions','emails','target_companies','profile'] loop
+    execute format('drop policy if exists owner_all on %I', t);
+    execute format('create policy owner_all on %I for all using (auth.uid() = %L)', t, uid);
+  end loop;
 end $$;
 ```
 
@@ -126,6 +153,49 @@ Then enable **Realtime** on `jobs`, `engine_status`, `commands`, and `emails`.
 > (interviews + offers + rejected, divided by total applied, as a percentage).
 > Interviews and Offers should be visually emphasized — those are the numbers
 > that matter.
+>
+> **5. Free-tier AI meter.** `engine_status.counters` includes `ai_used_today`,
+> `ai_remaining`, and `ai_percent_used`. Render a slim progress bar labeled
+> "Daily AI budget" showing used/limit, green under 70%, amber 70–90%, red
+> above 90%. When `ai_remaining` is 0, show the caption "Daily free-tier quota
+> spent — the run resumes automatically tomorrow." When `ai_remaining` is null,
+> show "Unlimited (local model)". This is how you stay at zero cost, so it
+> should be visible without scrolling.
+
+---
+
+## Prompt B2 — profile & resume editor
+
+> Build a **Settings → My Profile** page over the `profile` table. It is a
+> single row with `id = 1` — read it, edit it in place, never create more rows.
+>
+> Group the fields into collapsible sections:
+> - **Identity**: full_name, preferred_name, email, phone
+> - **Location**: address, city, province_state, country, postal_code
+> - **Links**: linkedin_url, github_url, portfolio_url
+> - **Compensation**: salary_expectation, salary_range_min, salary_range_max
+> - **Experience**: years_of_experience, education_level, target_role
+> - **Work authorization**: legally_authorized, require_sponsorship (both
+>   Yes/No selects)
+> - **EEO (voluntary)**: gender, race_ethnicity, veteran_status,
+>   disability_status — each a select including a "Decline to self-identify"
+>   option, which should be the default
+>
+> Below those, a **Resume** section: a large monospace textarea bound to
+> `resume_text`, with a live character count and a note reading "This is the
+> text the AI tailors for each job. Keep it complete and factual — the tailoring
+> step reorganizes and emphasizes, it never invents."
+>
+> Each section saves independently with an explicit Save button and a success
+> toast; do not autosave on every keystroke. Show "Last updated <relative time>"
+> from `updated_at` at the top of the page.
+>
+> Add a prominent note at the top: "The engine picks these changes up within a
+> minute. Email is what receives every application confirmation — make sure it
+> is right."
+>
+> Validation: email must be a valid address, and warn (do not block) if
+> salary_expectation is empty, since it is asked on most applications.
 
 ---
 

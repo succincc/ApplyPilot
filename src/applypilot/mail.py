@@ -187,7 +187,7 @@ def classify_ai(subject: str, body: str) -> str | None:
     )
 
     try:
-        response = get_client().ask(prompt)
+        response = get_client().ask_for("mail", prompt)
     except Exception:
         logger.debug("AI classification unavailable", exc_info=True)
         return None

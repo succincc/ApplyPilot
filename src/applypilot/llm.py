@@ -190,8 +190,19 @@ class LLMClient:
         messages: list[dict],
         temperature: float = 0.0,
         max_tokens: int = 4096,
+        stage: str | None = None,
     ) -> str:
-        """Send a chat completion request and return the assistant message text."""
+        """Send a chat completion request and return the assistant message text.
+
+        Args:
+            stage: Pipeline stage making the call (score/tailor/cover/apply/mail).
+                Used for daily free-tier budgeting — see budget.py. When the
+                stage has no quota left, BudgetExhausted is raised instead of
+                sending a request that would 429 and stall in backoff.
+        """
+        if stage:
+            from applypilot import budget
+            budget.check(stage)
         # Qwen3 optimization: prepend /no_think to skip chain-of-thought
         # reasoning, saving tokens on structured extraction tasks.
         if "qwen" in self.model.lower() and messages:
@@ -203,9 +214,14 @@ class LLMClient:
             try:
                 # Route to native Gemini if we've already confirmed it's needed
                 if self._use_native_gemini:
-                    return self._chat_native_gemini(messages, temperature, max_tokens)
+                    result = self._chat_native_gemini(messages, temperature, max_tokens)
+                else:
+                    result = self._chat_compat(messages, temperature, max_tokens)
 
-                return self._chat_compat(messages, temperature, max_tokens)
+                if stage:
+                    from applypilot import budget
+                    budget.record(stage)
+                return result
 
             except _GeminiCompatForbidden as exc:
                 # Model not available on OpenAI-compat layer — switch to native.
@@ -268,6 +284,10 @@ class LLMClient:
     def ask(self, prompt: str, **kwargs) -> str:
         """Convenience: single user prompt -> assistant response."""
         return self.chat([{"role": "user", "content": prompt}], **kwargs)
+
+    def ask_for(self, stage: str, prompt: str, **kwargs) -> str:
+        """Single prompt charged against a pipeline stage's daily budget."""
+        return self.chat([{"role": "user", "content": prompt}], stage=stage, **kwargs)
 
     def close(self) -> None:
         self._client.close()
