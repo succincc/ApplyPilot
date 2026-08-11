@@ -27,6 +27,7 @@ alter table jobs add column if not exists resume_pdf_path text;
 alter table jobs add column if not exists cover_letter_path text;
 alter table jobs add column if not exists updated_at timestamptz default now();
 alter table search_presets add column if not exists auto_run_hours numeric default 0;
+alter table search_presets add column if not exists apply_workers int default 2;
 
 create table if not exists profile (
   id int primary key default 1 check (id = 1),
