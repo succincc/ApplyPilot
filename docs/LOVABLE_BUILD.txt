@@ -1,0 +1,566 @@
+================================================================================
+  APPLYPILOT MISSION CONTROL — COMPLETE BUILD SPEC FOR LOVABLE
+================================================================================
+
+HOW TO USE THIS FILE
+  Copy everything between  >>> BEGIN  and  >>> END  and paste it into Lovable
+  as ONE message. It rebuilds the whole panel from scratch, including the
+  database. It is safe to send even if you already built part of it — every
+  database statement uses "if not exists".
+
+  You do NOT need to open Supabase. Lovable is connected to it and runs the
+  migration itself.
+
+READ THIS FIRST — WHY "START" DOES NOTHING RIGHT NOW
+  This panel is a remote control. It does not apply to jobs, and it cannot.
+  A web app in a browser tab cannot drive Chrome through a Workday login.
+
+  Pressing Start writes one row to a "commands" table. A program called the
+  engine, running on YOUR computer, picks that row up and does the actual
+  work: searching boards, scoring jobs, rewriting your resume, filling forms.
+
+  If the engine is not installed and running, Start writes a row that nobody
+  reads, and nothing happens — exactly what you have been seeing. No amount
+  of Lovable prompting changes this. Engine setup is at the bottom of this
+  file.
+
+  The header pill tells you which state you are in:
+      "Engine offline"  -> nothing will happen when you press Start
+      "Engine online"   -> Start works
+
+================================================================================
+>>> BEGIN
+================================================================================
+
+Build a private, single-user job-search control panel called "ApplyPilot
+Mission Control". It is a remote control for a separate program (the "engine")
+that runs on my own computer. They communicate ONLY through the Supabase
+database.
+
+CRITICAL CONSTRAINT, applies to everything below:
+This app must NEVER scrape job boards, call job-search APIs, generate resumes,
+or submit applications. It only reads and writes Supabase tables. The engine
+does all real work. If you think a feature needs to fetch a job or send an
+application, you have misunderstood — write a row to the database instead.
+
+No landing page. No marketing copy. No signup flow. Login goes straight to the
+app. Mobile-first: I drive this from my phone.
+
+--------------------------------------------------------------------------------
+PART 1 — DATABASE
+--------------------------------------------------------------------------------
+
+Run a migration on the connected Supabase project creating everything below.
+Use "if not exists" everywhere. After creating each table, enable row level
+security and add a policy granting all operations to the single authenticated
+user (match the pattern of any existing table; if none exists, allow any
+authenticated user).
+
+create table if not exists jobs (
+  id uuid primary key default gen_random_uuid(),
+  url text unique not null,
+  title text, company text, location text,
+  salary_text text, site text,
+  full_description text, application_url text,
+  fit_score int, score_reasoning text,
+  status text not null default 'discovered',
+  skip_reason text, attention_reason text,
+  confirmation_status text, confirmed_at timestamptz,
+  resume_pdf_path text, cover_letter_path text,
+  applied_at timestamptz, discovered_at timestamptz,
+  updated_at timestamptz default now(),
+  created_at timestamptz default now()
+);
+
+create table if not exists engine_status (
+  id int primary key default 1 check (id = 1),
+  online boolean default false,
+  last_heartbeat timestamptz,
+  current_stage text,
+  run_started_at timestamptz,
+  counters jsonb default '{}'
+);
+insert into engine_status (id) values (1) on conflict (id) do nothing;
+
+create table if not exists commands (
+  id uuid primary key default gen_random_uuid(),
+  command text not null,
+  payload jsonb default '{}',
+  status text default 'pending',
+  error text,
+  created_at timestamptz default now(),
+  handled_at timestamptz
+);
+
+create table if not exists search_presets (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  is_active boolean default false,
+  queries jsonb not null default '[]',
+  locations jsonb not null default '[]',
+  job_types text[] default '{fulltime}',
+  salary_floor int,
+  hours_old int default 168,
+  boards text[] default '{indeed,linkedin,glassdoor,zip_recruiter,google}',
+  extra_sources text[] default '{ats_registry,remote_boards}',
+  exclude_titles text[] default '{}',
+  exclude_companies text[] default '{}',
+  no_go_patterns text[] default '{commission only,commission-only,100% commission,unlimited earning potential,door to door,door-to-door,1099 only,multi-level marketing}',
+  min_score_auto_apply int default 6,
+  review_band_low int default 4,
+  daily_apply_cap int default 100,
+  apply_workers int default 2,
+  auto_run_hours numeric default 0,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+create table if not exists profile (
+  id int primary key default 1 check (id = 1),
+  full_name text, preferred_name text, email text, phone text,
+  address text, city text, province_state text, country text default 'United States',
+  postal_code text, linkedin_url text, github_url text, portfolio_url text,
+  salary_expectation text, salary_range_min text, salary_range_max text,
+  years_of_experience text, education_level text, target_role text,
+  legally_authorized text default 'Yes', require_sponsorship text default 'No',
+  gender text default 'Decline to self-identify',
+  race_ethnicity text default 'Decline to self-identify',
+  veteran_status text default 'I am not a protected veteran',
+  disability_status text default 'I do not wish to answer',
+  resume_text text, resume_file_path text, resume_file_name text,
+  resume_uploaded_at timestamptz, resume_parse_error text,
+  resume_word_count int, resume_warnings text,
+  updated_at timestamptz default now()
+);
+insert into profile (id) values (1) on conflict (id) do nothing;
+
+create table if not exists questions (
+  id uuid primary key default gen_random_uuid(),
+  question_normalized text unique not null,
+  question_raw text not null, answer text not null,
+  answer_type text default 'text', confidence text default 'low',
+  times_used int default 0, last_used_at timestamptz,
+  source_job_url text, created_at timestamptz default now()
+);
+
+create table if not exists emails (
+  id uuid primary key default gen_random_uuid(),
+  gmail_id text unique not null,
+  from_address text, subject text, snippet text, body_text text,
+  received_at timestamptz, category text, classified_by text,
+  job_id uuid references jobs(id) on delete set null,
+  is_read boolean default false, created_at timestamptz default now()
+);
+
+create table if not exists target_companies (
+  id uuid primary key default gen_random_uuid(),
+  company text not null, ats text not null, board_token text not null,
+  enabled boolean default true, created_at timestamptz default now()
+);
+
+create table if not exists interview_prep (
+  id uuid primary key default gen_random_uuid(),
+  job_url text unique not null,
+  job_id uuid references jobs(id) on delete cascade,
+  company text, title text, likely_questions text, talking_points text,
+  questions_to_ask text, company_notes text,
+  created_at timestamptz default now()
+);
+
+create table if not exists followups (
+  id uuid primary key default gen_random_uuid(),
+  job_url text unique not null,
+  job_id uuid references jobs(id) on delete cascade,
+  company text, title text, to_address text, subject text, body text,
+  status text default 'draft', days_since int,
+  created_at timestamptz default now()
+);
+
+create index if not exists idx_jobs_status on jobs(status);
+create index if not exists idx_jobs_applied on jobs(applied_at desc);
+create index if not exists idx_emails_received on emails(received_at desc);
+
+Also: create a PRIVATE storage bucket named "artifacts", and enable Supabase
+Realtime on the tables: jobs, engine_status, commands, emails.
+
+--------------------------------------------------------------------------------
+PART 2 — SHELL AND AUTH
+--------------------------------------------------------------------------------
+
+Email + password login via Supabase Auth only. No signup form, no social
+login. Unauthenticated users see only the login screen.
+
+Dark theme, dense, mobile-first. Navigation: bottom tab bar on mobile, left
+sidebar on desktop, with these items:
+  Dashboard, Jobs, Review, Prep, Questions, Inbox, Analytics, Settings
+
+Persistent header showing engine state, subscribed to engine_status via
+Realtime:
+  - last_heartbeat within the last 2 minutes  -> green dot,
+    "Engine online - {current_stage}"
+  - otherwise -> gray dot, "Engine offline"
+
+When the engine is offline, show a dismissible banner under the header:
+"The engine on your computer is not running. Nothing will happen when you
+press Start. Run ./start.sh on your computer."
+
+--------------------------------------------------------------------------------
+PART 3 — DASHBOARD
+--------------------------------------------------------------------------------
+
+Primary control at the top:
+
+  - If the engine is OFFLINE, always show a disabled "Start" button with the
+    caption "Engine offline". Never show Stop when the engine is offline,
+    regardless of current_stage.
+  - If a commands row with command='start_run' has status 'pending' or
+    'picked_up', show a disabled button reading "Queued - waiting for engine"
+    instead of inserting another row. If that row is older than 10 minutes
+    and the heartbeat is stale, show "Not picked up - engine offline?" plus a
+    Cancel button that sets that row's status to 'error'.
+  - Otherwise, if the engine is online and current_stage is 'idle', show
+    "Start". Pressing it inserts into commands:
+        { command: 'start_run', payload: { preset_id: <active preset id> } }
+  - If the engine is online and current_stage is not 'idle', show "Stop",
+    which inserts { command: 'stop' }.
+
+Setup blocker banner: when engine_status.current_stage begins with "blocked:",
+show a prominent amber panel titled "Engine can't run - setup incomplete" and
+list each string in engine_status.counters.setup_problems as a bullet. This is
+how the engine reports a missing resume or profile, so it must be impossible
+to miss.
+
+Counters row 1, from engine_status.counters (jsonb):
+  Discovered (key "discovered"), Scored ("scored"),
+  Applied today ("applied_today"), Needs attention ("attention")
+
+Counters row 2, computed from the jobs table, visually emphasized:
+  Interviews (status='interview'), Offers (status='offer'),
+  Awaiting reply (status='applied'),
+  Response rate = (interview + offer + rejected) / total applied, as a percent
+
+Daily AI budget bar, from counters keys ai_used_today, ai_remaining,
+ai_percent_used. Green under 70%, amber 70-90%, red above. When ai_remaining
+is 0: "Daily free-tier quota spent - resumes automatically tomorrow". When it
+is null: "Unlimited (local model)".
+
+Attention Queue: jobs where status='needs_attention'. Each card shows title,
+company, a colored badge for attention_reason (captcha / login_wall /
+unknown_question / error), a button opening application_url in a new tab, and
+"Mark resolved" which inserts
+{ command:'mark_resolved', payload:{ job_id } } and sets that job's status to
+'queued'.
+
+Today strip: the 10 most recent jobs with status='applied', by applied_at.
+
+--------------------------------------------------------------------------------
+PART 4 — SETTINGS: MY PROFILE  (most important screen)
+--------------------------------------------------------------------------------
+
+Edits the single profile row where id = 1. Read it, update it in place, never
+insert more rows.
+
+Collapsible sections with their own Save buttons (do not autosave on every
+keystroke):
+  Identity: full_name, preferred_name, email, phone
+  Location: address, city, province_state, country, postal_code
+  Links: linkedin_url, github_url, portfolio_url
+  Compensation: salary_expectation, salary_range_min, salary_range_max
+  Experience: years_of_experience, education_level, target_role
+  Work authorization: legally_authorized, require_sponsorship
+      IMPORTANT: both are TEXT columns and must be saved as the literal
+      strings "Yes" or "No". Never save booleans true/false — these answers
+      are typed onto legal application forms.
+  EEO (voluntary): gender, race_ethnicity, veteran_status, disability_status,
+      each a dropdown whose default is the decline option.
+
+Resume section:
+  A drag-and-drop upload area accepting .pdf, .docx and .txt, max 10 MB.
+  On upload, put the file in the "artifacts" bucket at path
+  "base/resume<extension>" with upsert, then update profile id=1 with
+  resume_file_path, resume_file_name, resume_uploaded_at = now(), and set
+  resume_parse_error to null.
+
+  Show the current file as a card: filename, relative upload time, a Download
+  button using a signed URL, and Replace.
+
+  Below it show parse status from the profile row:
+    resume_parse_error not null -> red panel, heading "Could not read this
+        file", with the error text
+    resume_word_count not null  -> green "Parsed: {resume_word_count} words",
+        and each newline-separated entry of resume_warnings as an amber bullet
+    neither                     -> gray "Waiting for the engine to process
+        this file..."
+
+  Below that, resume_text in a collapsed read-only monospace textarea labeled
+  "Extracted text (what the AI reads)", with an Edit button making it
+  editable and saveable.
+
+  Helper text, exactly: "Upload the resume you already have. The original file
+  is what employers receive, so your formatting is kept. The extracted text is
+  what the AI rewrites for each job. Scanned or image-only PDFs will not work
+  - export a text-based PDF from Word or Google Docs."
+
+Validation: require a valid email. Warn (do not block) if salary_expectation
+is empty.
+
+--------------------------------------------------------------------------------
+PART 5 — SETTINGS: SEARCH PRESETS
+--------------------------------------------------------------------------------
+
+List presets with an Active radio; setting one active sets is_active=false on
+all others. Exactly one must be active for the engine to run.
+
+Create/edit form:
+  Job titles: tag input grouped into three tiers. Saves to queries as
+      [{"query":"customer success manager","tier":1}, ...]
+      Helper: "Use words that actually appear in job postings. Tier 1 is your
+      exact target, Tier 3 is the wide net."
+  Locations: repeatable rows of { location text, Remote toggle, radius slider
+      5-100 miles }. Saves to locations as
+      [{"location":"Tampa, FL","remote":false,"radius_miles":25}, ...]
+      Helper: "Write cities the way a job board shows them, e.g. 'Tampa, FL'.
+      Add 'Remote' as its own row to include remote roles."
+  Employment type: checkboxes -> job_types
+  Salary floor: number -> salary_floor, with helper "Jobs that don't list a
+      salary still pass. Most postings omit it."
+  Posted within: select 24h/72h/7d/14d -> hours_old as 24/72/168/336
+  Boards: checkbox group -> boards
+  Extra sources: checkbox group over ats_registry, usajobs, remote_boards ->
+      extra_sources. Default ats_registry and remote_boards ON, with helper
+      "Free public APIs. No scraping, and they link straight to employer
+      application forms."
+  Blocklists: tag inputs -> exclude_titles, exclude_companies; an editable
+      tag list for no_go_patterns prefilled from the column default
+  Automation:
+      min_score_auto_apply slider 1-10, label "Auto-apply at or above"
+      review_band_low slider, label "Send to Review at or above"
+      daily_apply_cap number 10-500
+      apply_workers select 1-6, helper "Parallel browser windows on your
+          computer. Each needs about 1.5 GB of RAM."
+      auto_run_hours select: Manual only (0), Every 4 hours (4), Every 8 (8),
+          Every 12 (12), Once a day (24)
+
+Validate: at least one job title and one location before saving.
+
+--------------------------------------------------------------------------------
+PART 6 — JOBS BOARD
+--------------------------------------------------------------------------------
+
+Kanban over jobs with columns: Discovered, Queued, Applying, Applied,
+Interview, Offer, Rejected. Map status values: 'discovered', 'queued',
+'applying', 'applied', 'interview', 'offer', and merge 'rejected',
+'rejected_by_me' and 'failed' into Rejected with sub-badges. Realtime updates.
+On mobile the columns become horizontally swipeable full-width panes.
+
+Card: title, company, location, fit_score chip (8-10 green, 6-7 lime, 4-5
+amber, <=3 gray), site badge, relative time. For anything applied or later,
+show a confirmation dot: green filled = confirmation_status 'confirmed'
+(tooltip "Employer acknowledged - submission verified"), gray hollow =
+'pending' ("Waiting on acknowledgement"), amber outline = 'unconfirmed' ("No
+reply after 48h - this submission may not have gone through").
+
+Dragging a card between columns updates status. Filters bar: text search on
+title/company, score range, site multi-select, date range. Column headers show
+counts.
+
+Clicking a card opens a detail drawer: full_description rendered and
+scrollable, score_reasoning, salary_text, links to the posting and
+application_url, signed-URL download buttons for resume_pdf_path and
+cover_letter_path from the artifacts bucket, a timeline of discovered_at ->
+applied_at -> confirmed_at, linked emails (from emails where job_id matches,
+newest first with category badges), and buttons:
+  Apply now  -> insert { command:'apply_one', payload:{ job_id } }
+  Skip       -> status 'rejected_by_me'
+  Block company -> add company to the active preset's exclude_companies and
+                   set status 'rejected_by_me'
+
+--------------------------------------------------------------------------------
+PART 7 — REVIEW
+--------------------------------------------------------------------------------
+
+Jobs with status='review', one at a time, full screen: title, company,
+location, salary, score chip, score_reasoning, first ~40 lines of the
+description with expand. Two large buttons: Apply (status -> 'queued') and
+Pass (status -> 'rejected_by_me'). Swipe right = apply, left = pass on touch;
+arrow keys on desktop. Show "N remaining" and an undo snackbar. Empty state:
+"Review queue clear - the bot is handling everything above your threshold."
+
+--------------------------------------------------------------------------------
+PART 8 — PREP  (two tabs)
+--------------------------------------------------------------------------------
+
+Interviews tab, over interview_prep: one expandable card per row, newest
+first, headed by title and company. Inside, four labeled sections rendered as
+readable lists — the text arrives as newline-separated lines beginning with
+"- ": Likely questions, Your talking points, Questions to ask them, and an
+"About this role" paragraph from company_notes. Add "Copy all" and a link to
+the linked job. Empty state: "No interviews yet. Prep is generated
+automatically the moment an interview email arrives."
+
+Follow-ups tab, over followups where status='draft': cards showing company,
+title, "applied {days_since} days ago", an editable subject and an editable
+body textarea. Buttons: Copy, Mark sent (status='sent'), Dismiss
+(status='dismissed'), and when to_address is set, "Open in email" linking to
+mailto:{to_address}?subject={subject}&body={body}, URL-encoded.
+Note at the top: "These are drafts. Nothing is ever sent automatically."
+
+--------------------------------------------------------------------------------
+PART 9 — QUESTIONS
+--------------------------------------------------------------------------------
+
+Two tabs over the questions table.
+  Needs review (confidence='low'), newest first: question_raw, an inline
+    editable answer, times_used, a link to source_job_url, and Confirm which
+    sets confidence='high'. Include "Confirm all shown". Show a count badge in
+    the nav.
+  Confirmed (confidence='high'): searchable table of question, answer,
+    times_used, last_used_at, with inline editing and delete-with-confirm.
+Header line: "The engine answers from this bank first. Anything it had to
+guess lands in Needs review - confirm it once and it's locked in."
+
+--------------------------------------------------------------------------------
+PART 10 — INBOX
+--------------------------------------------------------------------------------
+
+Feed over emails, newest first, with filter chips carrying unread counts
+(is_read=false): Action needed, Interview, Offer, Rejection, Confirmation,
+Other. Action needed and Interview are pinned above the fold by default.
+
+Row: category color bar, from_address, subject, snippet, relative time, and a
+chip with the linked job's company and status when job_id is set. Clicking
+opens a drawer with body_text, marks is_read=true, and offers: open the linked
+job, Re-link (search jobs by company, set job_id), and Re-categorize.
+
+Subscribe to Realtime inserts filtered to category 'interview' and 'offer';
+on arrival show a toast and fire a browser notification.
+
+Empty state: "No job email yet. The engine scans your inbox every 10 minutes
+once it's running."
+
+--------------------------------------------------------------------------------
+PART 11 — ANALYTICS
+--------------------------------------------------------------------------------
+
+Computed from jobs and emails:
+  - Funnel: Discovered -> Applied -> Response -> Interview -> Offer with
+    conversion percentages. "Response" means a job with any linked email whose
+    category is not 'confirmation'.
+  - Applications per day, last 30 days, bar chart.
+  - Response rate by site, by fit-score band (<=3 / 4-5 / 6-7 / 8-10), and by
+    the first word of the job title. Three horizontal bar charts, caption
+    "Point volume where the bars are longest."
+  - Confirmation rate by source: for each site with at least 5 applications
+    older than 48 hours, the percentage with confirmation_status='confirmed',
+    sorted ascending, bars under 40% in amber. Caption exactly: "Some
+    employers never acknowledge applications, so a low number is not proof of
+    failure on its own. Compare sources - if one ATS confirms 80% and another
+    confirms 5%, submissions to the second are probably failing silently."
+  - Blocked jobs table: jobs with a skip_reason, grouped by reason with
+    counts, so I can audit that the filters are not discarding good jobs.
+
+--------------------------------------------------------------------------------
+PART 12 — SETTINGS: TARGET COMPANIES
+--------------------------------------------------------------------------------
+
+Table over target_companies: company name, ATS select (greenhouse / lever /
+ashby / workday), board_token, enabled toggle. Under the token field, show the
+resulting URL for the chosen ATS so it can be checked:
+  greenhouse -> boards-api.greenhouse.io/v1/boards/{token}/jobs
+  lever      -> api.lever.co/v0/postings/{token}
+  ashby      -> api.ashbyhq.com/posting-api/job-board/{token}
+  workday    -> handled by the engine's employer registry
+Explain in one line: "The token is the company's slug in its job board URL -
+job-boards.greenhouse.io/stripe means the token is 'stripe'. These boards have
+the highest application success rate."
+
+--------------------------------------------------------------------------------
+PART 13 — POLISH
+--------------------------------------------------------------------------------
+
+Every page: a loading skeleton, a designed empty state, and an error state
+with retry. Every write shows a failure toast and rolls back optimistic UI on
+error. Realtime subscriptions re-subscribe automatically after network loss.
+The engine pill flips to offline on its own when the heartbeat goes stale,
+with no page refresh.
+
+Security: the only Supabase credential in the client bundle must be the anon
+key — never a service key. No route may render data before the auth check
+resolves. Storage downloads use short-lived signed URLs. Remove any
+console.log that prints row data.
+
+================================================================================
+>>> END
+================================================================================
+
+
+================================================================================
+  AFTER LOVABLE FINISHES: MAKING START ACTUALLY WORK
+================================================================================
+
+The panel will look empty and every screen will say "no data". That is
+correct. The engine fills those tables.
+
+ON YOUR COMPUTER (Windows, Mac or Linux — not your phone):
+
+  1. Install Python 3.11+, Node.js 18+, Google Chrome, and the Claude Code
+     CLI from claude.ai/code.
+
+  2. Install the engine. BOTH pip lines are required — the second one is not
+     optional, and skipping it is the most common reason discovery finds zero
+     jobs:
+
+       pip install applypilot pypdf
+       pip install --no-deps python-jobspy
+       pip install pydantic tls-client requests markdownify regex
+
+  3. Get a free Gemini API key at aistudio.google.com. No credit card. Never
+     click "Enable billing" — that deletes the free tier.
+
+  4. Create the file ~/.applypilot/.env containing:
+
+       GEMINI_API_KEY=your_key_here
+       SUPABASE_URL=https://yourproject.supabase.co
+       SUPABASE_SERVICE_KEY=your_service_role_key
+       MAIL_ADDRESS=thomasdeluca0727@gmail.com
+       MAIL_APP_PASSWORD=your_google_app_password
+
+     Both Supabase values are in Supabase under Settings > API. Use the
+     service_role key; it stays on your computer and never goes in the panel.
+     The app password comes from myaccount.google.com/apppasswords.
+
+     MAIL_ADDRESS must be the SAME address as the email in your panel
+     profile. If they differ, employer confirmations arrive at an inbox
+     nothing is watching, and your Inbox screen stays empty forever.
+
+  5. Fill in the panel: Settings > My Profile (name, email, phone, work
+     authorization), upload your resume, then Settings > Search Presets and
+     create one with your job titles and locations, marked Active.
+
+  6. Start the engine:
+
+       applypilot doctor     every line should read OK
+       applypilot verify     live-tests the job sources, email and Supabase
+       applypilot sync       the bridge; leave this running
+
+     Within 30 seconds the panel's pill turns green. You do NOT need to run
+     "applypilot init" — the bridge creates everything from what you entered
+     in the panel.
+
+  7. Before trusting it with volume, prove one application:
+
+       applypilot run all
+       applypilot apply --dry-run --limit 1
+
+     That fills a real form on a real posting and stops before submitting.
+     Watch the Chrome window. If the fields look right, drop --dry-run.
+
+  8. Then press Start in the panel and leave it alone.
+
+IF START STILL DOES NOTHING
+  - Pill gray/offline  -> the bridge is not running. Step 6.
+  - Amber setup banner -> do exactly what it lists, then press Start again.
+  - Runs but finds 0 jobs -> the terminal running the bridge prints the
+    specific cause and the fix. Most often the second pip line from step 2
+    was skipped, or the job titles in your preset are not words that appear
+    in real postings.
