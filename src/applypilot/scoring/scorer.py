@@ -269,11 +269,37 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     # Free triage first: reject unambiguous mismatches without spending a
     # request on them. Rejected jobs get a real score of 1 so they are
     # excluded from the apply queue but still auditable in the panel.
-    from applypilot.filters import prescore
+    #
+    # The user's own filters (blocked titles and companies, salary floor,
+    # commission-only and other no-go patterns) are re-applied here as well.
+    # They run during discovery, but only in the JobSpy and public-API paths —
+    # Workday and smart-extract jobs would otherwise reach the apply queue
+    # having never been checked against them. Re-checking at the last free
+    # moment before any spend makes the rule hold no matter how a job arrived.
+    from applypilot.filters import job_passes, load_filter_config, prescore
+    from applypilot.config import load_search_config
+
+    try:
+        user_filters = load_filter_config(load_search_config())
+    except Exception:
+        log.exception("Could not load search filters; scoring without them")
+        user_filters = None
 
     kept: list[dict] = []
     prefiltered: list[tuple[str, str]] = []
     for job in jobs:
+        if user_filters is not None:
+            allowed, why = job_passes({
+                "title": job.get("title"),
+                "company": job.get("site"),
+                "location": job.get("location"),
+                "salary": job.get("salary"),
+                "description": job.get("full_description") or job.get("description"),
+            }, user_filters)
+            if not allowed:
+                prefiltered.append((job["url"], why or "excluded by your filters"))
+                continue
+
         worth, reason = prescore(job)
         if worth:
             kept.append(job)

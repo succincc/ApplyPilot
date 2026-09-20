@@ -273,28 +273,112 @@ def assemble_resume_text(data: dict, profile: dict) -> str:
     # Experience
     lines.append("EXPERIENCE")
     for entry in data.get("experience", []):
-        lines.append(sanitize_text(entry.get("header", "")))
-        if entry.get("subtitle"):
-            lines.append(sanitize_text(entry["subtitle"]))
-        for b in entry.get("bullets", []):
-            lines.append(f"- {sanitize_text(b)}")
-        lines.append("")
+        lines.extend(_render_entry(entry))
 
-    # Projects
-    lines.append("PROJECTS")
-    for entry in data.get("projects", []):
-        lines.append(sanitize_text(entry.get("header", "")))
-        if entry.get("subtitle"):
-            lines.append(sanitize_text(entry["subtitle"]))
-        for b in entry.get("bullets", []):
-            lines.append(f"- {sanitize_text(b)}")
-        lines.append("")
+    # Projects — only when there are any. An empty header on a resume with no
+    # projects looks like a mistake to a human reader and to an ATS parser.
+    projects = data.get("projects") or []
+    if projects:
+        lines.append("PROJECTS")
+        for entry in projects:
+            lines.extend(_render_entry(entry))
 
     # Education
     lines.append("EDUCATION")
-    lines.append(sanitize_text(str(data.get("education", ""))))
+    lines.extend(_render_education(data.get("education")))
 
     return "\n".join(lines)
+
+
+def _entry_header(entry: dict) -> str:
+    """Build a readable "Company - Title (Dates)" line from an entry.
+
+    Models return this structure in several shapes. The original code read
+    only `header`, so a response using the far more natural company/title/
+    dates keys produced a blank line — silently deleting the employer name
+    from the resume sent to employers. Accept both, and assemble the header
+    from parts when no explicit one is given.
+    """
+    if entry.get("header"):
+        return sanitize_text(str(entry["header"]))
+
+    org = entry.get("company") or entry.get("organization") or entry.get("name") or ""
+    title = entry.get("title") or entry.get("role") or entry.get("position") or ""
+    dates = entry.get("dates") or entry.get("date") or entry.get("period") or ""
+
+    left = " - ".join(p for p in (str(org).strip(), str(title).strip()) if p)
+    if dates:
+        left = f"{left} ({str(dates).strip()})" if left else str(dates).strip()
+    return sanitize_text(left)
+
+
+def _render_entry(entry) -> list[str]:
+    """Render one experience/project entry, tolerating plain strings."""
+    if isinstance(entry, str):
+        return [sanitize_text(entry), ""]
+    if not isinstance(entry, dict):
+        return [sanitize_text(str(entry)), ""]
+
+    out: list[str] = []
+    header = _entry_header(entry)
+    if header:
+        out.append(header)
+
+    subtitle = entry.get("subtitle") or entry.get("location") or ""
+    if subtitle and str(subtitle).strip() not in header:
+        out.append(sanitize_text(str(subtitle)))
+
+    bullets = entry.get("bullets") or entry.get("highlights") or entry.get("achievements") or []
+    if isinstance(bullets, str):
+        bullets = [bullets]
+    for bullet in bullets:
+        text = sanitize_text(str(bullet)).lstrip("-•* ").strip()
+        if text:
+            out.append(f"- {text}")
+
+    description = entry.get("description")
+    if description and not bullets:
+        out.append(sanitize_text(str(description)))
+
+    out.append("")
+    return out
+
+
+def _render_education(education) -> list[str]:
+    """Render education as readable lines, never as a Python repr.
+
+    A structured value used to be passed through str(), which wrote
+    "[{'school': 'University of South Florida', ...}]" onto the resume.
+    """
+    if not education:
+        return []
+    if isinstance(education, str):
+        return [sanitize_text(education)]
+    if isinstance(education, dict):
+        education = [education]
+
+    out: list[str] = []
+    for item in education:
+        if isinstance(item, str):
+            out.append(sanitize_text(item))
+            continue
+        if not isinstance(item, dict):
+            out.append(sanitize_text(str(item)))
+            continue
+
+        school = item.get("school") or item.get("institution") or item.get("university") or ""
+        degree = item.get("degree") or item.get("qualification") or item.get("program") or ""
+        dates = item.get("dates") or item.get("date") or item.get("year") or ""
+        detail = item.get("details") or item.get("gpa") or ""
+
+        line = " - ".join(p for p in (str(school).strip(), str(degree).strip()) if p)
+        if dates:
+            line = f"{line} ({str(dates).strip()})" if line else str(dates).strip()
+        if line:
+            out.append(sanitize_text(line))
+        if detail:
+            out.append(sanitize_text(str(detail)))
+    return out
 
 
 # ── LLM Judge ────────────────────────────────────────────────────────────
@@ -573,18 +657,37 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
     conn.commit()
 
     elapsed = time.time() - t0
+    approved = stats.get("approved", 0) + stats.get("approved_with_judge_warning", 0)
+    # Every non-approved outcome is a failure to produce something submittable.
+    # Counting only the two named failure statuses previously reported
+    # "0 approved, 0 failed" when every job exhausted its retries, which reads
+    # as success and hides the reason nothing is ever applied to.
+    unusable = sum(count for status, count in stats.items()
+                   if status not in ("approved", "approved_with_judge_warning"))
+
     log.info(
-        "Tailoring done in %.1fs: %d approved, %d failed_validation, %d failed_judge, %d errors",
-        elapsed,
-        stats.get("approved", 0),
+        "Tailoring done in %.1fs: %d approved, %d unusable "
+        "(validation %d, judge %d, retries exhausted %d, errors %d)",
+        elapsed, approved, unusable,
         stats.get("failed_validation", 0),
         stats.get("failed_judge", 0),
+        stats.get("exhausted_retries", 0),
         stats.get("error", 0),
     )
 
+    if approved == 0 and jobs:
+        log.error(
+            "No tailored resumes were produced from %d job(s), so there is "
+            "nothing for the apply stage to submit. Most common cause: the "
+            "model's output failed validation repeatedly. Re-run with "
+            "--validation lenient to relax the checks.",
+            len(jobs),
+        )
+
     return {
-        "approved": stats.get("approved", 0),
-        "failed": stats.get("failed_validation", 0) + stats.get("failed_judge", 0),
+        "approved": approved,
+        "failed": unusable,
         "errors": stats.get("error", 0),
         "elapsed": elapsed,
+        "by_status": dict(stats),
     }

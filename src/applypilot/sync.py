@@ -36,6 +36,10 @@ from applypilot.database import get_connection
 
 logger = logging.getLogger(__name__)
 
+# Free, key-less API sources enabled unless a preset says otherwise.
+# usajobs is omitted because it needs a (free) key the user must request.
+DEFAULT_EXTRA_SOURCES = ["ats_registry", "remote_boards"]
+
 HEARTBEAT_INTERVAL = 30
 COMMAND_INTERVAL = 15
 MIRROR_INTERVAL = 60
@@ -349,7 +353,11 @@ class SyncDaemon:
             "exclude_titles": exclude_titles,
             "exclude_companies": preset.get("exclude_companies") or [],
             "salary_floor": preset.get("salary_floor"),
-            "extra_sources": preset.get("extra_sources") or [],
+            # Free public APIs are on unless explicitly turned off. They need
+            # no scraping, are never rate limited, and point straight at
+            # employer application forms — leaving them off by default made
+            # the most reliable sources the ones least likely to run.
+            "extra_sources": preset.get("extra_sources") or DEFAULT_EXTRA_SOURCES,
         }
         config.SEARCH_CONFIG_PATH.write_text(
             yaml.safe_dump(data, sort_keys=False, allow_unicode=True),
@@ -362,39 +370,66 @@ class SyncDaemon:
 
         Returns a list of human-readable problems (empty = good to go).
         Without these, a run would 'succeed' while submitting nothing.
+
+        Messages name the control panel rather than the setup wizard, because
+        the panel can supply all of this — see bootstrap_from_panel().
         """
         problems: list[str] = []
 
+        # The panel is a valid source for everything below, so try adopting
+        # whatever it has before declaring anything missing.
+        try:
+            self.bootstrap_from_panel()
+        except Exception:
+            logger.exception("Could not bootstrap config from the panel")
+
         if not config.PROFILE_PATH.exists():
             problems.append(
-                "No profile.json — run 'applypilot init' (your name, email, "
-                "work authorization, salary, EEO answers)")
+                "No profile yet — open Settings > My Profile in the panel and "
+                "fill in at least your name, email, and phone, then press Start "
+                "again.")
         else:
             try:
-                profile = config.load_profile()
-                email = (profile.get("personal") or {}).get("email", "")
-                if not email or "example.com" in email:
-                    problems.append(
-                        "profile.json still has a placeholder email — employer "
-                        "confirmations would go nowhere")
+                from applypilot.profile import validate
+                problems.extend(validate(config.load_profile()))
             except (json.JSONDecodeError, OSError) as e:
                 problems.append(f"profile.json unreadable: {e}")
 
         if not config.RESUME_PATH.exists():
             if config.RESUME_PDF_PATH.exists():
                 problems.append(
-                    "resume.pdf found but resume.txt missing — the AI stages need "
-                    "plain text; run 'applypilot init'")
+                    "A resume PDF is present but no text was extracted from it. "
+                    "Re-upload it in the panel — a scanned or image-only PDF "
+                    "cannot be read.")
             else:
                 problems.append(
-                    "No resume — run 'applypilot init' and provide your resume. "
-                    "Nothing can be tailored or uploaded without it")
+                    "No resume yet — upload one in Settings > My Profile. "
+                    "Nothing can be tailored or submitted without it.")
 
         if not any(os.environ.get(k) for k in
                    ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL")):
             problems.append(
                 "No LLM API key — set GEMINI_API_KEY in ~/.applypilot/.env "
                 "(free at aistudio.google.com)")
+
+        # Without an active preset the discovery stage silently falls back to
+        # the shipped example config and searches for somebody else's job in
+        # somebody else's city. Wrong results are worse than no results,
+        # because nothing reports them as wrong.
+        try:
+            preset = self.preset or self.fetch_preset(None)
+        except httpx.HTTPError:
+            preset = None
+        if not preset or not preset.get("queries"):
+            problems.append(
+                "No active search preset — open Settings > Search Presets in "
+                "the panel, add at least one job title and location, and mark "
+                "it Active. Without it the engine would search for the wrong "
+                "jobs entirely.")
+        elif not preset.get("locations"):
+            problems.append(
+                "The active search preset has no locations — add at least one "
+                "(a city, or 'Remote').")
 
         # Applying with one address while watching another means every
         # confirmation and recruiter reply is invisible.
@@ -796,6 +831,93 @@ class SyncDaemon:
             pass
 
     # -- profile + resume from the panel ------------------------------------
+
+    def bootstrap_from_panel(self) -> bool:
+        """Create profile.json and resume.txt from panel data if they're missing.
+
+        Removes the chicken-and-egg problem where the bridge refused to run
+        without a profile, while the panel — the thing that can supply one —
+        could only reach the engine through the bridge. With this, the entire
+        setup can be done from a phone: fill in the profile, upload a resume,
+        press Start.
+
+        Returns True if anything was created.
+        """
+        created = False
+
+        try:
+            rows = self.sb.select("profile", "limit=1")
+        except httpx.HTTPError:
+            return False
+        if not rows:
+            return False
+        row = rows[0]
+
+        if not config.PROFILE_PATH.exists():
+            # Require the minimum that makes an application possible at all.
+            if not (row.get("full_name") and row.get("email")):
+                return False
+
+            from applypilot.profile import normalize
+            skeleton, _ = normalize({
+                "personal": {
+                    "full_name": row.get("full_name") or "",
+                    "preferred_name": row.get("preferred_name") or "",
+                    "email": row.get("email") or "",
+                    "phone": row.get("phone") or "",
+                    "address": row.get("address") or "",
+                    "city": row.get("city") or "",
+                    "province_state": row.get("province_state") or "",
+                    "country": row.get("country") or "United States",
+                    "postal_code": row.get("postal_code") or "",
+                    "linkedin_url": row.get("linkedin_url") or "",
+                    "github_url": row.get("github_url") or "",
+                    "portfolio_url": row.get("portfolio_url") or "",
+                },
+                "work_authorization": {
+                    "legally_authorized_to_work": row.get("legally_authorized") or "Yes",
+                    "require_sponsorship": row.get("require_sponsorship") or "No",
+                },
+                "compensation": {
+                    "salary_expectation": row.get("salary_expectation") or "",
+                    "salary_range_min": row.get("salary_range_min") or "",
+                    "salary_range_max": row.get("salary_range_max") or "",
+                },
+                "experience": {
+                    "years_of_experience_total": row.get("years_of_experience") or "",
+                    "education_level": row.get("education_level") or "",
+                    "target_role": row.get("target_role") or "",
+                },
+                "eeo_voluntary": {
+                    "gender": row.get("gender") or "Decline to self-identify",
+                    "race_ethnicity": row.get("race_ethnicity") or "Decline to self-identify",
+                    "veteran_status": row.get("veteran_status") or "I am not a protected veteran",
+                    "disability_status": row.get("disability_status") or "I do not wish to answer",
+                },
+            })
+            config.PROFILE_PATH.write_text(
+                json.dumps(skeleton, indent=2, ensure_ascii=False), encoding="utf-8")
+            logger.info("Created profile.json from the panel — no wizard needed")
+            created = True
+
+        # A resume uploaded in the panel counts as the resume
+        if not config.RESUME_PATH.exists():
+            if row.get("resume_file_path"):
+                self._pull_resume_file(row)
+                created = created or config.RESUME_PATH.exists()
+            elif (row.get("resume_text") or "").strip():
+                config.RESUME_PATH.write_text(row["resume_text"], encoding="utf-8")
+                logger.info("Created resume.txt from panel text")
+                created = True
+
+        # A preset with queries is enough to run a search
+        if not config.SEARCH_CONFIG_PATH.exists():
+            preset = self.preset or self.fetch_preset(None)
+            if preset and preset.get("queries"):
+                self.render_searches_yaml(preset)
+                created = True
+
+        return created
 
     def sync_profile(self) -> None:
         """Pull profile fields and resume text edited in the panel.

@@ -68,7 +68,15 @@ FABRICATION_WATCHLIST: set[str] = {
     "certif", "certified", "pmp", "scrum master", "aws certified",
 }
 
-REQUIRED_SECTIONS: set[str] = {"SUMMARY", "TECHNICAL SKILLS", "EXPERIENCE", "PROJECTS", "EDUCATION"}
+# Sections every resume must have. PROJECTS is deliberately NOT required:
+# most careers outside software engineering have no projects section, and
+# demanding one is worse than useless — it fails tailoring for those resumes
+# entirely, and pressures the model to invent projects to satisfy the check,
+# which is the exact fabrication this validator exists to prevent.
+REQUIRED_SECTIONS: set[str] = {"SUMMARY", "SKILLS", "EXPERIENCE", "EDUCATION"}
+
+# Present when relevant, never required.
+OPTIONAL_SECTIONS: set[str] = {"PROJECTS", "CERTIFICATIONS", "AWARDS", "PUBLICATIONS"}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -113,12 +121,18 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
     errors: list[str] = []
     warnings: list[str] = []
 
-    # Required keys — always checked regardless of mode
-    for key in ("title", "summary", "skills", "experience", "projects", "education"):
+    # Required keys — always checked regardless of mode.
+    # 'projects' is intentionally excluded: see REQUIRED_SECTIONS. Requiring
+    # it fails every job for resumes that legitimately have no projects, and
+    # pushes the model to fabricate them.
+    for key in ("title", "summary", "skills", "experience", "education"):
         if key not in data or not data[key]:
             errors.append(f"Missing required field: {key}")
     if errors:
         return {"passed": False, "errors": errors, "warnings": warnings}
+
+    # Normalize the optional field so downstream rendering can assume it exists
+    data.setdefault("projects", [])
 
     # Collect all text for bulk checks
     all_text_parts: list[str] = [data["summary"]]
@@ -204,15 +218,23 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
 
     # 1. Check required sections exist (flexible matching)
     section_variants: dict[str, list[str]] = {
-        "SUMMARY": ["summary", "professional summary", "profile"],
-        "TECHNICAL SKILLS": ["technical skills", "skills", "tech stack", "core skills", "technologies"],
-        "EXPERIENCE": ["experience", "work experience", "professional experience"],
-        "PROJECTS": ["projects", "personal projects", "key projects", "selected projects"],
-        "EDUCATION": ["education", "academic background"],
+        "SUMMARY": ["summary", "professional summary", "profile", "objective", "about"],
+        "SKILLS": ["technical skills", "skills", "tech stack", "core skills",
+                   "technologies", "competencies", "core competencies", "expertise"],
+        "EXPERIENCE": ["experience", "work experience", "professional experience",
+                       "employment", "work history", "career history"],
+        "EDUCATION": ["education", "academic background", "academics"],
     }
     for section, variants in section_variants.items():
         if not any(v in text_lower for v in variants):
             errors.append(f"Missing required section: {section} (or variant)")
+
+    # Projects are noted when absent but never block: plenty of real careers
+    # (operations, customer success, sales, healthcare, finance) have none,
+    # and requiring one would either fail every job or invite invention.
+    if not any(v in text_lower for v in
+               ("projects", "key projects", "selected projects", "portfolio")):
+        warnings.append("No projects section — fine for non-technical resumes")
 
     # 2. Check name preserved (warn, don't error -- we can inject it)
     full_name = personal.get("full_name", "")

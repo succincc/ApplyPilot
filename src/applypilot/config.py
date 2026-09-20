@@ -91,14 +91,39 @@ def ensure_dirs():
         d.mkdir(parents=True, exist_ok=True)
 
 
-def load_profile() -> dict:
-    """Load user profile from ~/.applypilot/profile.json."""
+def load_profile(raw: bool = False) -> dict:
+    """Load the user profile, normalized into the canonical shape.
+
+    Normalization matters because this data is typed onto legal application
+    forms. It coerces yes/no answers that were stored as booleans (the setup
+    wizard produces those, and "Work Auth: True" is not an acceptable answer
+    to a work-authorization question), renames keys that drifted between the
+    wizard and the readers, and fills missing sections so prompt building
+    cannot fail halfway through a run.
+
+    Args:
+        raw: Return the file exactly as stored, without normalization.
+             Used by tooling that needs to rewrite the file itself.
+    """
     import json
+
+    from applypilot.profile import normalize
+
     if not PROFILE_PATH.exists():
         raise FileNotFoundError(
             f"Profile not found at {PROFILE_PATH}. Run `applypilot init` first."
         )
-    return json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
+
+    data = json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
+    if raw:
+        return data
+
+    normalized, notes = normalize(data)
+    if notes:
+        import logging
+        logging.getLogger(__name__).debug(
+            "profile.json normalized: %s", "; ".join(notes))
+    return normalized
 
 
 def load_search_config() -> dict:

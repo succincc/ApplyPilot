@@ -113,7 +113,62 @@ def _run_discover(workers: int = 1) -> dict:
         console.print(f"  [red]Smart extract error:[/red] {e}")
         stats["smartextract"] = f"error: {e}"
 
+    _diagnose_empty_discovery(stats)
     return stats
+
+
+def _diagnose_empty_discovery(stats: dict) -> None:
+    """Explain a zero-job discovery run instead of reporting a quiet 'partial'.
+
+    Finding nothing is the single most common way this pipeline appears
+    broken, and every cause has a different fix. Reporting the count without
+    the reason leaves the user with no next step, so name the specific
+    failure and what to do about it.
+    """
+    from applypilot.database import get_connection
+
+    try:
+        total = get_connection().execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+    except Exception:
+        return
+    if total:
+        return
+
+    console.print("\n[bold red]No jobs were discovered.[/bold red] Causes found:\n")
+
+    jobspy = str(stats.get("jobspy") or "")
+    if "No module named" in jobspy or "jobspy" in jobspy.lower() and "error" in jobspy:
+        console.print(
+            "  [yellow]1.[/yellow] JobSpy is not installed — this is the main source "
+            "for Indeed, LinkedIn,\n     Glassdoor, ZipRecruiter and Google Jobs. "
+            "Install it with BOTH commands:\n"
+            "       [bold]pip install --no-deps python-jobspy[/bold]\n"
+            "       [bold]pip install pydantic tls-client requests markdownify regex[/bold]\n"
+        )
+
+    ats = stats.get("ats")
+    if isinstance(ats, dict) and ats.get("new", 0) == 0 and not ats.get("by_source"):
+        console.print(
+            "  [yellow]2.[/yellow] No free API sources ran. In the panel, open your search "
+            "preset and\n     enable extra sources: [bold]ats_registry, usajobs, "
+            "remote_boards[/bold].\n     These need no scraping and are the most "
+            "reliable sources available.\n"
+        )
+
+    workday = str(stats.get("workday") or "")
+    if "403" in workday or "Forbidden" in workday or "error" in workday.lower():
+        console.print(
+            "  [yellow]3.[/yellow] Employer portals were unreachable (network blocked or "
+            "rate limited).\n     If you are on a VPN or restricted network, try "
+            "without it.\n"
+        )
+
+    console.print(
+        "  [dim]Also check: your search preset's job titles are terms that appear in "
+        "real\n  postings, your location is spelled as a job board would show it "
+        "(e.g. 'Tampa, FL'),\n  and 'posted within' is not too narrow. "
+        "Run [bold]applypilot verify[/bold] to test each source.[/dim]\n"
+    )
 
 
 def _run_enrich(workers: int = 1) -> dict:
