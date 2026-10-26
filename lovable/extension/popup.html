@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root { color-scheme: dark; }
+  body {
+    width: 320px; margin: 0; padding: 14px;
+    background: #0b0f14; color: #d7e0ea;
+    font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  h1 { font-size: 13px; margin: 0 0 2px; color: #10b981; letter-spacing: .04em; }
+  .sub { color: #5b6b7d; font-size: 11px; margin-bottom: 12px; }
+  label { display: block; color: #7d8ea0; margin: 8px 0 3px; font-size: 11px; }
+  input[type=text], input[type=password] {
+    width: 100%; box-sizing: border-box; padding: 6px 8px;
+    background: #121820; border: 1px solid #22303d; border-radius: 4px;
+    color: #d7e0ea; font: inherit;
+  }
+  input:focus { outline: none; border-color: #10b981; }
+  button {
+    width: 100%; padding: 9px; margin-top: 10px; cursor: pointer;
+    background: #10b981; border: 0; border-radius: 4px;
+    color: #04120c; font: inherit; font-weight: 700; letter-spacing: .04em;
+  }
+  button.ghost { background: #121820; color: #9fb0c2; border: 1px solid #22303d; }
+  button.stop  { background: #ef4444; color: #fff; }
+  button:disabled { opacity: .45; cursor: default; }
+  .row { display: flex; gap: 8px; }
+  .row button { margin-top: 8px; }
+  .stats { display: grid; grid-template-columns: repeat(3,1fr); gap: 6px; margin-top: 12px; }
+  .stat { background: #121820; border: 1px solid #1b2733; border-radius: 4px;
+          padding: 7px 4px; text-align: center; }
+  .stat b { display: block; font-size: 16px; color: #e8f0f8; }
+  .stat span { color: #5b6b7d; font-size: 9px; text-transform: uppercase; letter-spacing: .06em; }
+  #msg { margin-top: 10px; padding: 7px 8px; border-radius: 4px; font-size: 11px;
+         display: none; white-space: pre-wrap; }
+  .ok   { background: #06281c; color: #34d399; display: block !important; }
+  .err  { background: #2a0e0e; color: #fca5a5; display: block !important; }
+  .warn { background: #2a2109; color: #fcd34d; display: block !important; }
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+         background: #475569; margin-right: 5px; vertical-align: middle; }
+  .dot.live { background: #10b981; box-shadow: 0 0 6px #10b981; }
+  .toggle { display: flex; align-items: center; gap: 6px; margin-top: 10px;
+            color: #7d8ea0; font-size: 11px; }
+  details summary { cursor: pointer; color: #5b6b7d; margin-top: 12px; font-size: 11px; }
+</style>
+</head>
+<body>
+  <h1>APPLYPILOT AGENT</h1>
+  <div class="sub"><span class="dot" id="dot"></span><span id="state">idle</span></div>
+
+  <div class="stats" id="stats" style="display:none">
+    <div class="stat"><b id="s_queued">0</b><span>queued</span></div>
+    <div class="stat"><b id="s_today">0</b><span>today</span></div>
+    <div class="stat"><b id="s_help">0</b><span>need you</span></div>
+  </div>
+
+  <div class="row">
+    <button id="start">START APPLYING</button>
+  </div>
+  <div class="row">
+    <button id="stop" class="ghost stop" style="display:none">STOP</button>
+  </div>
+
+  <label class="toggle">
+    <input type="checkbox" id="dry"> dry run (fill but never submit)
+  </label>
+
+  <div id="msg"></div>
+
+  <details id="setup">
+    <summary>connection settings</summary>
+    <label>Supabase URL</label>
+    <input type="text" id="url" placeholder="https://xxxx.supabase.co" spellcheck="false">
+    <label>Supabase anon key</label>
+    <input type="password" id="key" placeholder="eyJhbGci..." spellcheck="false">
+    <button id="save" class="ghost">SAVE &amp; TEST</button>
+  </details>
+
+  <script src="popup.js"></script>
+</body>
+</html>

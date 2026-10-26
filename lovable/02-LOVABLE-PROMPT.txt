@@ -1,0 +1,271 @@
+================================================================================
+  APPLYPILOT — LOVABLE BUILD SPEC
+  Copy everything between  >>> BEGIN  and  >>> END  into Lovable as ONE message.
+================================================================================
+
+>>> BEGIN
+
+Build "ApplyPilot" — a private, single-user job application control panel.
+
+=== DESIGN: TERMINAL ===
+
+The entire app looks like a terminal / code editor. No rounded cards, no
+gradients, no marketing polish, no emoji.
+
+  Background      #0b0f14
+  Panel           #121820
+  Border          #1b2733  (1px, square corners — border-radius 2px max)
+  Text            #d7e0ea
+  Dim text        #5b6b7d
+  Accent / green  #10b981
+  Warning / amber #f59e0b
+  Error / red     #ef4444
+  Cyan            #22d3ee
+
+  Font: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace — EVERYWHERE,
+  including headings, numbers and buttons.
+
+  Section headers are lowercase in brackets, dim:   [ pipeline ]
+  Buttons are uppercase with letter-spacing:        RUN DISCOVERY
+  Status values use a leading dot:                  ● online   ○ offline
+  Numbers are large, monospace, left-aligned, no thousands separators under 10k.
+  Tables are dense: 28px rows, 1px borders, no zebra striping, no shadows.
+  Nav is a left sidebar on desktop (fixed 180px) / bottom bar on mobile, items
+  lowercase: dashboard, jobs, review, answers, inbox, settings.
+
+Mobile-first: everything must work one-handed on a phone.
+
+=== AUTH ===
+
+Supabase email+password login only. No signup form, no social login, no
+landing page. Unauthenticated users see only a centered login box styled like
+a terminal prompt. After login, go straight to the dashboard.
+
+=== DATABASE ===
+
+The schema already exists (or will be created by a separate migration). Read
+it and generate types. Tables: profile, search_config, companies, jobs,
+answers, emails, runs, agent. Views: v_stats, v_apply_queue. RPC functions:
+claim_next_job, find_answer.
+
+Do NOT create new tables or rename columns.
+
+=== CRITICAL: EVERY BUTTON MUST DO SOMETHING REAL ===
+
+This app is wired to Supabase Edge Functions. Buttons are not decorative.
+
+  RUN DISCOVERY  ->  await supabase.functions.invoke('discover')
+  RUN SCORING    ->  await supabase.functions.invoke('score')
+
+Both return JSON like { ok: true, inserted: 42, message: "..." }.
+
+For every invoke:
+  - disable the button and show an inline spinner while it runs
+  - these take 20-90 seconds; do not time out before 180s
+  - on success, show the returned `message` in a green inline log line AND
+    refresh the affected data
+  - on failure, show the error text in a red inline log line that stays
+    visible until dismissed. Never fail silently. Never show a generic
+    "something went wrong".
+
+All other actions are plain Supabase table writes (update status, save
+profile, confirm an answer). Each one shows a brief inline confirmation and
+optimistically updates the row, rolling back on error.
+
+=== PAGE: DASHBOARD ===
+
+Top line, like a shell prompt, showing two independent status indicators:
+
+  agent     from the `agent` table: ● applying / ● idle / ○ offline
+            (offline = last_seen older than 2 minutes)
+  queue     count of jobs where status='queued'
+
+Under that, a one-line explainer that is ALWAYS visible when agent is offline:
+  "Agent offline. The Chrome extension applies to jobs — install it and press
+   START APPLYING, or nothing will be submitted."
+
+[ pipeline ] — a horizontal strip of counts from the v_stats view (keys:
+new, review, queued, applied, needs_help, interviews, offers, rejected), each
+clickable to filter the Jobs page:
+  new  review  queued  applied  need_you  interview  offer  rejected
+
+[ today ] — three big numbers: applied_today, interviews, offers.
+
+[ actions ] — two buttons side by side:
+  RUN DISCOVERY   (calls the discover Edge Function)
+  RUN SCORING     (calls the score Edge Function)
+  Under them, dim text: "discovery finds jobs. scoring rates them and tailors
+  your resume for the good ones. the chrome extension does the applying."
+
+[ needs you ] — jobs where status='needs_help'. Each row shows title, company,
+the help_reason as a colored tag (captcha / login / resume_upload /
+unknown_question / error), the last_error text if present, an OPEN button
+(opens apply_url in a new tab) and a DONE button (sets status back to
+'queued' so the agent retries it).
+
+[ log ] — the last 10 rows of `runs`, newest first, rendered like terminal
+output, one line each:
+
+  14:32:07  discover  done   42 new jobs from 6 sources
+  14:28:51  score     done   scored 60, tailored 8
+  14:20:03  discover  error  No job titles configured...
+
+Color the status word: done=green, error=red, running=amber. Subscribe to the
+runs table via Realtime so new lines appear live.
+
+=== PAGE: JOBS ===
+
+A dense table (not cards): score | title | company | location | status | age.
+
+  - score is a colored 2-char cell: 8-10 green, 6-7 cyan, 4-5 amber, <=3 dim
+  - status is a lowercase tag
+  - age is relative ("2h", "3d")
+  - clicking a row expands it inline (accordion, not a modal) showing the
+    description in a scrollable monospace block, score_reason, the salary,
+    the tailored resume if present, and action buttons:
+        QUEUE (status -> 'queued')
+        SKIP  (status -> 'skipped')
+        OPEN  (opens apply_url in a new tab)
+        BLOCK (adds company to search_config.exclude_companies, sets skipped)
+
+Filter bar across the top: a text input that filters title/company as you
+type, plus status filter chips, plus a score-minimum number input. Filters
+must apply to the query, not just the visible page.
+
+Paginate 50 rows at a time. Subscribe to Realtime so statuses update live.
+
+=== PAGE: REVIEW ===
+
+Jobs with status='review', one at a time, full width:
+title, company, location, salary, score with its reason, and the first 40
+lines of the description with an expand toggle.
+
+Two large buttons: QUEUE IT (status -> 'queued') and PASS (status ->
+'skipped'). Support left/right arrow keys and swipe. Show "n remaining".
+Empty state: "nothing to review."
+
+=== PAGE: ANSWERS ===
+
+The screening-question memory bank, over the `answers` table. Two tabs:
+
+  [ needs answer ] — rows where confirmed=false. These are questions a form
+  asked that we could not answer. Each row: the question text, an editable
+  input for the answer (a dropdown if field_type='select'), and a SAVE button
+  that sets the answer and confirmed=true. Show a count badge in the nav.
+
+  [ saved ] — rows where confirmed=true: question, answer (inline editable),
+  times_used, last_used. Searchable. Delete with confirm.
+
+Header line, dim: "the agent answers from this list first. anything it could
+not answer lands here — fill it once and it is used forever."
+
+=== PAGE: INBOX ===
+
+Over the `emails` table, newest first. Filter chips with unread counts:
+action_needed, interview, offer, rejection, confirmation, other.
+Pin action_needed and interview to the top.
+
+Each row: a 1-char colored status block, from_addr, subject, relative time,
+and the linked job's company if job_id is set. Clicking expands the body
+inline and marks is_read=true.
+
+Empty state: "no job email yet."
+
+=== PAGE: SETTINGS ===
+
+Four sections as collapsible blocks, each with its own SAVE button.
+
+[ profile ] — edits the single row in `profile` where id=1:
+  full_name, preferred_name, email, phone
+  address, city, state, postal_code, country
+  linkedin_url, github_url, portfolio_url
+  target_role, years_experience, education_level
+  salary_expectation (number), earliest_start
+
+  Then work authorization and EEO as DROPDOWNS, never checkboxes:
+    work_authorized      Yes / No
+    needs_sponsorship    No / Yes
+    over_18              Yes / No
+    can_background_check Yes / No
+    willing_to_relocate  No / Yes
+    veteran_status       "I am not a protected veteran" / "I am a protected
+                         veteran" / "I do not wish to answer"
+    disability_status    "I do not wish to answer" / "Yes" / "No"
+    gender               "Decline to self-identify" / "Male" / "Female" /
+                         "Non-binary"
+    race_ethnicity       "Decline to self-identify" plus the standard US EEO
+                         categories
+
+  These are stored as TEXT and typed verbatim onto legal application forms.
+  Never store or send booleans for them.
+
+[ resume ] — a textarea bound to profile.resume_text, monospace, 20 rows,
+with a live word count underneath. Also accept a .txt file drop that reads
+the file client-side and fills the textarea.
+  Dim note: "this exact text is what gets rewritten for each job. paste your
+  full resume."
+  If resume_text is empty, show an amber line: "no resume — scoring and
+  tailoring will not run."
+
+[ search ] — edits the single row in `search_config` where id=1:
+  titles            tag input (text[])    label "job titles to search"
+  locations         tag input (text[])    label "locations"
+  remote_ok         toggle
+  salary_floor      number
+  exclude_titles    tag input
+  exclude_companies tag input
+  no_go_patterns    tag input (prefilled from the column default)
+  auto_apply_score  slider 1-10, label "auto-apply at or above"
+  review_score      slider 1-10, label "send to review at or above"
+  daily_cap         number
+  sources           checkbox group: greenhouse, lever, ashby, remotive,
+                    remoteok, arbeitnow, workable, usajobs
+
+  Validation: at least one title and one location. Show an amber warning if
+  titles is empty: "without job titles, discovery returns thousands of
+  irrelevant postings."
+
+[ companies ] — a table over `companies`: name, ats (select: greenhouse /
+lever / ashby / workable), token, enabled toggle, last_pulled, job_count.
+Add and delete rows inline.
+  Dim note under the token field: "the company's slug in its job board url.
+  job-boards.greenhouse.io/stripe means the token is 'stripe'. these feeds
+  are free, need no key, and link straight to the employer's own application
+  form."
+
+[ agent ] — read-only status block showing the `agent` row: online, state,
+last_seen, applied_today, version. Plus static install instructions for the
+Chrome extension, in a monospace code block.
+
+=== POLISH ===
+
+Every page: a loading state that looks like a blinking terminal cursor, a
+designed empty state in dim monospace, and an error state showing the real
+error text.
+
+Realtime subscriptions on jobs, runs, agent and emails, re-subscribing after
+network loss.
+
+Security: only the anon key in the client bundle. No route renders data
+before the auth check resolves.
+
+This app must NEVER scrape job boards, call job APIs directly from the
+browser, or try to submit applications itself. Discovery and scoring happen
+in Edge Functions; applying happens in the Chrome extension. The app's job is
+to display data, write rows, and invoke those two functions.
+
+>>> END
+
+================================================================================
+  AFTER LOVABLE FINISHES
+================================================================================
+
+Lovable builds the panel. Three things make it actually work — all free, and
+in this order:
+
+  1. DATABASE        paste 01-schema.sql into Supabase > SQL Editor
+  2. EDGE FUNCTIONS  deploy discover + score (see 03-DEPLOY.txt)
+  3. EXTENSION       load the extension folder in Chrome (see 03-DEPLOY.txt)
+
+Without #2 the RUN buttons return an error. Without #3 nothing is ever
+submitted, because no web page can fill out a form on another site.

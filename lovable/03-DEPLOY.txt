@@ -1,0 +1,207 @@
+================================================================================
+  DEPLOY — 25 minutes, all free, no credit card
+================================================================================
+
+Three things to set up. Do them in order. Each one is independently testable,
+so you always know which part is broken.
+
+  1. DATABASE       5 min   makes the panel show real structure
+  2. EDGE FUNCTIONS 10 min  makes RUN DISCOVERY / RUN SCORING work
+  3. EXTENSION      5 min   makes applications actually get submitted
+
+--------------------------------------------------------------------------------
+STEP 0 — GET A FREE GEMINI KEY  (2 min)
+--------------------------------------------------------------------------------
+
+  1. Go to  aistudio.google.com/apikey
+  2. Click "Create API key". No credit card is asked for.
+  3. Copy the key somewhere — you need it in step 2.
+
+  NEVER click "Enable billing" on that Google account. Enabling billing
+  DELETES the free tier for the project; it does not add headroom on top of
+  it. Left alone, the free tier never charges you — exceeding the daily quota
+  just returns an error until the next day.
+
+--------------------------------------------------------------------------------
+STEP 1 — DATABASE  (5 min)
+--------------------------------------------------------------------------------
+
+  1. Open your Supabase project -> SQL Editor -> New query
+  2. Paste the entire contents of  01-schema.sql
+  3. Run it.
+
+  You should see "Success. No rows returned."
+
+  Verify: go to Table Editor. You should now have profile, search_config,
+  companies, jobs, answers, emails, runs and agent, and `companies` should
+  already contain about 16 seeded ATS boards.
+
+  (If Lovable already created some of these, this is still safe — every
+  statement uses "if not exists".)
+
+--------------------------------------------------------------------------------
+STEP 2 — EDGE FUNCTIONS  (10 min)
+--------------------------------------------------------------------------------
+
+These run on Supabase's servers, not in your browser. That matters: server
+side there is no CORS and no bot detection, so the free job APIs just work.
+
+  A. Install the CLI (one line, pick your OS):
+
+       macOS      brew install supabase/tap/supabase
+       Windows    scoop install supabase
+       Linux      npm install -g supabase
+
+  B. In a terminal, from the folder containing this file:
+
+       supabase login
+       supabase link --project-ref YOUR_PROJECT_REF
+
+     YOUR_PROJECT_REF is the subdomain of your Supabase URL. If your URL is
+     https://abcdefgh.supabase.co then the ref is  abcdefgh
+
+  C. Set the Gemini key as a secret (never put it in the panel):
+
+       supabase secrets set GEMINI_API_KEY=paste_your_key_here
+
+  D. Deploy both functions:
+
+       supabase functions deploy discover --no-verify-jwt
+       supabase functions deploy score --no-verify-jwt
+
+  E. Test discovery right now, from the terminal:
+
+       curl -i -X POST \
+         "https://YOUR_REF.supabase.co/functions/v1/discover" \
+         -H "Authorization: Bearer YOUR_ANON_KEY"
+
+     Expect JSON with  "ok": true  and an "inserted" count.
+
+     If it returns 0 inserted with a message about job titles, that is
+     correct and expected — go to Settings -> search in the panel, add your
+     job titles and locations, then run it again.
+
+  PREFER CLICKING TO TYPING? You can also create each function in the
+  Supabase dashboard under Edge Functions -> Deploy a new function, paste the
+  contents of edge/discover/index.ts and edge/score/index.ts, and set the
+  secret under Project Settings -> Edge Functions -> Secrets.
+
+--------------------------------------------------------------------------------
+STEP 3 — CHROME EXTENSION  (5 min)
+--------------------------------------------------------------------------------
+
+This is what actually fills and submits applications. It has to be an
+extension: no website can fill in a form on a different website, and no API
+exists for applicants to submit applications — Greenhouse and Lever both
+require the EMPLOYER's secret key, which you will never have. Every working
+auto-applier drives a browser. Running inside your own Chrome means your
+existing logins work and nothing looks like a robot.
+
+  1. Open Chrome and go to:   chrome://extensions
+  2. Turn on "Developer mode" (top right).
+  3. Click "Load unpacked".
+  4. Select the  extension  folder.
+  5. Pin the ApplyPilot icon to your toolbar.
+  6. Click the icon -> "connection settings":
+       Supabase URL        https://YOUR_REF.supabase.co
+       Supabase anon key   (Supabase -> Settings -> API -> anon public)
+     Press SAVE & TEST. It should say "Connected as <your name>".
+
+  The anon key is safe here. It is the same public key the panel uses, and
+  row level security governs what it can touch. Never paste the service_role
+  key into the extension.
+
+--------------------------------------------------------------------------------
+FIRST RUN — PROVE IT WORKS
+--------------------------------------------------------------------------------
+
+  1. Panel -> Settings -> profile: fill in name, email, phone, city, state.
+  2. Panel -> Settings -> resume: paste your full resume text.
+  3. Panel -> Settings -> search: add job titles (e.g. "customer success
+     manager", "account manager") and locations (e.g. "Tampa, FL", "Remote").
+  4. Panel -> Dashboard -> RUN DISCOVERY.  Expect a green log line with a
+     count. The Jobs page fills up.
+  5. Panel -> Dashboard -> RUN SCORING.    Jobs get scores; good ones move to
+     queued and get a tailored resume.
+  6. Extension icon -> tick "dry run" -> START APPLYING.
+
+     Dry run fills real forms on real postings and stops before submitting.
+     Watch a tab open, fill itself in, and close. Check a couple by hand.
+
+  7. When you are satisfied, untick dry run and press START APPLYING again.
+
+--------------------------------------------------------------------------------
+WHAT RUNS WHERE  (so you always know what to blame)
+--------------------------------------------------------------------------------
+
+  Panel (Lovable)      shows data, writes rows, presses the two RUN buttons
+  Edge Functions       find jobs, score them, tailor resumes — 24/7, cloud
+  Chrome extension     fills and submits forms — only while Chrome is open
+
+  Discovery and scoring do NOT need your computer on. Applying does.
+
+--------------------------------------------------------------------------------
+AUTOMATE IT (optional)
+--------------------------------------------------------------------------------
+
+Run discovery and scoring on a schedule so the queue is always full. In the
+Supabase SQL Editor, replacing both placeholders:
+
+  select cron.schedule('applypilot-discover', '0 */4 * * *', $$
+    select net.http_post(
+      url := 'https://YOUR_REF.supabase.co/functions/v1/discover',
+      headers := '{"Authorization":"Bearer YOUR_ANON_KEY","Content-Type":"application/json"}'::jsonb
+    );
+  $$);
+
+  select cron.schedule('applypilot-score', '30 */4 * * *', $$
+    select net.http_post(
+      url := 'https://YOUR_REF.supabase.co/functions/v1/score',
+      headers := '{"Authorization":"Bearer YOUR_ANON_KEY","Content-Type":"application/json"}'::jsonb
+    );
+  $$);
+
+Discovery every 4 hours, scoring 30 minutes later. To stop:
+
+  select cron.unschedule('applypilot-discover');
+  select cron.unschedule('applypilot-score');
+
+Note: free Supabase projects pause after a week with no activity. Daily use
+keeps it awake.
+
+--------------------------------------------------------------------------------
+TROUBLESHOOTING
+--------------------------------------------------------------------------------
+
+RUN DISCOVERY returns an error
+  The function is not deployed, or the Gemini secret is missing. Re-run
+  step 2D. Check Supabase -> Edge Functions -> Logs for the real reason.
+
+Discovery says 0 new jobs
+  The log line names the cause. Usually: no job titles set in Settings ->
+  search, titles too specific ("Senior Customer Success Manager II" matches
+  nothing — use "customer success"), or every company in Settings ->
+  companies is disabled.
+
+RUN SCORING says quota reached
+  You hit the Gemini free daily limit. Nothing was charged. It resumes
+  tomorrow, or switch to a cheaper model by setting the GEMINI_MODEL secret.
+
+Extension says "Connection failed"
+  Wrong URL or key. The URL has no trailing slash and no /rest/v1 on the end.
+  The key is the anon public key, not the service_role key.
+
+Agent shows offline in the panel
+  Chrome is closed, or you have not pressed START APPLYING, or the extension
+  is not connected.
+
+Lots of jobs land in "need you"
+  Normal. CAPTCHAs, logins and resume-upload forms cannot be automated — a
+  file input can only be set by a real human click, which is a browser
+  security rule, not a limitation of this code. Those come back to you with
+  every other field already filled, so each takes seconds. Clear them in
+  batches from the dashboard.
+
+Nothing is being applied to
+  Check in this order: queue count > 0 on the dashboard; agent shows online;
+  dry run is OFF; daily cap not already reached.
