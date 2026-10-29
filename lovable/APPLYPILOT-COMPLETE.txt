@@ -1,0 +1,2172 @@
+================================================================================
+  APPLYPILOT — COMPLETE BUILD
+  Everything Lovable needs, in one file. Attach this and say "build this".
+================================================================================
+
+INSTRUCTIONS FOR LOVABLE — READ THIS SECTION FIRST
+
+You are building a private, single-user job application system. It finds jobs,
+scores them against a resume, rewrites the resume for each one, and submits the
+applications automatically.
+
+Work through PART 1 to PART 5 in order. Every piece of code you need is inline
+in this file — nothing is missing and nothing needs to be fetched.
+
+THE ONE ARCHITECTURAL RULE, which explains most of the decisions below:
+
+  This web app must NEVER scrape job boards, call job APIs from the browser, or
+  try to submit an application itself.
+
+  Two hard constraints force this:
+    1. The job APIs send no CORS headers, so any browser-side fetch is blocked.
+       That is why discovery runs in an Edge Function on the server.
+    2. No web page can fill in a form on a different website, and no API exists
+       for an applicant to submit an application — Greenhouse and Lever both
+       require the employer's secret key. That is why submitting runs in a
+       GitHub Actions workflow driving a real browser.
+
+  If you find yourself writing a fetch to a job board in React, stop. The
+  answer is an Edge Function or the GitHub workflow.
+
+BUILD ORDER
+  PART 1  database schema          run as a migration
+  PART 2  three Edge Functions     deploy to Supabase
+  PART 3  the applier              two files committed to this repo
+  PART 4  the panel UI             terminal-styled React
+  PART 5  secrets to ask the user for
+
+If anything in PART 1-3 fails, say so plainly and stop rather than building the
+UI on top of a broken foundation.
+
+
+================================================================================
+  PART 1 — DATABASE
+================================================================================
+
+Run this as a migration against the connected Supabase project. It is
+idempotent, so it is safe even if some tables already exist.
+
+```sql
+
+-- ============================================================================
+-- APPLYPILOT — COMPLETE DATABASE SCHEMA
+-- Paste into Supabase SQL Editor, or let Lovable run it as a migration.
+-- Safe to re-run: every statement is idempotent.
+-- ============================================================================
+
+create extension if not exists pg_cron;
+create extension if not exists pg_net;
+create extension if not exists pg_trgm;
+
+-- ---------------------------------------------------------------------------
+-- profile — one row. Everything that gets typed onto an application form.
+-- ---------------------------------------------------------------------------
+create table if not exists profile (
+  id                int primary key default 1 check (id = 1),
+  full_name         text,
+  preferred_name    text,
+  email             text,
+  phone             text,
+  address           text,
+  city              text,
+  state             text,
+  country           text default 'United States',
+  postal_code       text,
+  linkedin_url      text,
+  github_url        text,
+  portfolio_url     text,
+
+  -- Work authorization. TEXT, never boolean: these are typed onto legal
+  -- forms and "True" is not an answer to "are you authorized to work?"
+  work_authorized   text default 'Yes',
+  needs_sponsorship text default 'No',
+  veteran_status    text default 'I am not a protected veteran',
+  disability_status text default 'I do not wish to answer',
+  gender            text default 'Decline to self-identify',
+  race_ethnicity    text default 'Decline to self-identify',
+  over_18           text default 'Yes',
+  can_background_check text default 'Yes',
+
+  target_role       text,
+  years_experience  text,
+  education_level   text,
+  salary_expectation int,
+  salary_min        int,
+  earliest_start    text default 'Immediately',
+  willing_to_relocate text default 'No',
+
+  resume_text       text,
+  resume_file_path  text,
+  resume_file_name  text,
+  resume_word_count int,
+  resume_error      text,
+
+  updated_at        timestamptz default now()
+);
+insert into profile (id) values (1) on conflict (id) do nothing;
+
+-- ---------------------------------------------------------------------------
+-- search_config — one row. What to look for.
+-- ---------------------------------------------------------------------------
+create table if not exists search_config (
+  id               int primary key default 1 check (id = 1),
+  titles           text[] default '{}',          -- ["customer success manager", ...]
+  locations        text[] default '{Remote}',
+  remote_ok        boolean default true,
+  salary_floor     int default 0,
+  exclude_titles   text[] default '{intern,internship,director,vice president,vp,chief,senior director,principal}',
+  exclude_companies text[] default '{}',
+  no_go_patterns   text[] default '{commission only,commission-only,100% commission,unlimited earning potential,door to door,door-to-door,1099 only,multi-level marketing,pyramid,be your own boss,purchase your own leads}',
+  auto_apply_score int default 6,                -- >= this auto-applies
+  review_score     int default 4,                -- >= this goes to review
+  daily_cap        int default 100,
+  sources          text[] default '{greenhouse,lever,ashby,remotive,remoteok,arbeitnow,workable,usajobs}',
+  updated_at       timestamptz default now()
+);
+insert into search_config (id) values (1) on conflict (id) do nothing;
+
+-- ---------------------------------------------------------------------------
+-- companies — ATS boards to pull directly. The highest-yield source.
+-- ---------------------------------------------------------------------------
+create table if not exists companies (
+  id          uuid primary key default gen_random_uuid(),
+  name        text not null,
+  ats         text not null check (ats in ('greenhouse','lever','ashby','workable','smartrecruiters')),
+  token       text not null,
+  enabled     boolean default true,
+  last_pulled timestamptz,
+  job_count   int default 0,
+  created_at  timestamptz default now(),
+  unique (ats, token)
+);
+
+-- ---------------------------------------------------------------------------
+-- jobs — the pipeline
+-- ---------------------------------------------------------------------------
+create table if not exists jobs (
+  id            uuid primary key default gen_random_uuid(),
+  url           text unique not null,
+  apply_url     text,
+  title         text not null,
+  company       text,
+  location      text,
+  remote        boolean default false,
+  salary_text   text,
+  salary_min    int,
+  salary_max    int,
+  description   text,
+  source        text,                    -- greenhouse | lever | remotive | ...
+  ats           text,                    -- which ATS the apply form uses
+
+  score         int,
+  score_reason  text,
+  scored_at     timestamptz,
+
+  tailored_resume text,
+  tailored_at   timestamptz,
+
+  status        text not null default 'new',
+  -- new | scored | review | queued | applying | applied | needs_help
+  -- | interview | offer | rejected | skipped | failed
+  skip_reason   text,
+  help_reason   text,                    -- captcha | login | unknown_question | error
+
+  applied_at    timestamptz,
+  confirmed_at  timestamptz,
+  confirm_state text,                    -- confirmed | pending | unconfirmed
+
+  attempts      int default 0,
+  last_error    text,
+  posted_at     timestamptz,
+  found_at      timestamptz default now(),
+  updated_at    timestamptz default now()
+);
+
+create index if not exists idx_jobs_status   on jobs(status);
+create index if not exists idx_jobs_score    on jobs(score desc nulls last);
+create index if not exists idx_jobs_applied  on jobs(applied_at desc);
+create index if not exists idx_jobs_found    on jobs(found_at desc);
+create index if not exists idx_jobs_company  on jobs using gin (company gin_trgm_ops);
+
+-- ---------------------------------------------------------------------------
+-- answers — screening-question memory. Answer once, reused forever.
+-- ---------------------------------------------------------------------------
+create table if not exists answers (
+  id          uuid primary key default gen_random_uuid(),
+  q_key       text unique not null,      -- normalized question text
+  question    text not null,             -- as first seen
+  answer      text not null,
+  field_type  text default 'text',       -- text | select | radio | checkbox | number
+  confirmed   boolean default false,     -- false = AI guessed, needs review
+  times_used  int default 0,
+  last_used   timestamptz,
+  created_at  timestamptz default now()
+);
+create index if not exists idx_answers_key on answers using gin (q_key gin_trgm_ops);
+
+-- ---------------------------------------------------------------------------
+-- emails — classified inbox
+-- ---------------------------------------------------------------------------
+create table if not exists emails (
+  id          uuid primary key default gen_random_uuid(),
+  message_id  text unique not null,
+  from_addr   text,
+  subject     text,
+  snippet     text,
+  body        text,
+  received_at timestamptz,
+  category    text,   -- interview | offer | rejection | action_needed | confirmation | other
+  job_id      uuid references jobs(id) on delete set null,
+  is_read     boolean default false,
+  created_at  timestamptz default now()
+);
+create index if not exists idx_emails_received on emails(received_at desc);
+create index if not exists idx_emails_category on emails(category);
+
+-- ---------------------------------------------------------------------------
+-- runs — log of every discover/score cycle, so nothing fails silently
+-- ---------------------------------------------------------------------------
+create table if not exists runs (
+  id          uuid primary key default gen_random_uuid(),
+  kind        text not null,            -- discover | score | tailor | inbox
+  status      text default 'running',   -- running | done | error
+  found       int default 0,
+  processed   int default 0,
+  errors      int default 0,
+  detail      jsonb default '{}',
+  message     text,
+  started_at  timestamptz default now(),
+  ended_at    timestamptz
+);
+create index if not exists idx_runs_started on runs(started_at desc);
+
+-- ---------------------------------------------------------------------------
+-- agent — heartbeat from the Chrome extension
+-- ---------------------------------------------------------------------------
+create table if not exists agent (
+  id           int primary key default 1 check (id = 1),
+  online       boolean default false,
+  last_seen    timestamptz,
+  state        text default 'idle',     -- idle | applying | paused
+  current_job  uuid references jobs(id) on delete set null,
+  applied_today int default 0,
+  version      text
+);
+insert into agent (id) values (1) on conflict (id) do nothing;
+
+-- ---------------------------------------------------------------------------
+-- VIEWS the UI reads directly
+-- ---------------------------------------------------------------------------
+create or replace view v_stats as
+select
+  count(*)                                               as total,
+  count(*) filter (where status = 'new')                 as new,
+  count(*) filter (where status = 'review')              as review,
+  count(*) filter (where status = 'queued')              as queued,
+  count(*) filter (where status = 'applied')             as applied,
+  count(*) filter (where status = 'needs_help')          as needs_help,
+  count(*) filter (where status = 'interview')           as interviews,
+  count(*) filter (where status = 'offer')               as offers,
+  count(*) filter (where status = 'rejected')            as rejected,
+  count(*) filter (where applied_at::date = current_date) as applied_today,
+  count(*) filter (where confirm_state = 'confirmed')    as confirmed
+from jobs;
+
+-- The queue the Chrome extension pulls from. Ordered best-first.
+create or replace view v_apply_queue as
+select j.id, j.url, j.apply_url, j.title, j.company, j.ats, j.score,
+       j.tailored_resume, j.description
+from jobs j
+where j.status = 'queued'
+  and j.attempts < 3
+order by j.score desc nulls last, j.found_at asc;
+
+-- ---------------------------------------------------------------------------
+-- AUTO-ROUTING: a scored job lands in the right lane with no extra code.
+-- ---------------------------------------------------------------------------
+create or replace function route_scored_job() returns trigger as $$
+declare cfg record;
+begin
+  if new.score is null or new.score = old.score then return new; end if;
+  select * into cfg from search_config where id = 1;
+
+  if new.score >= cfg.auto_apply_score then
+    new.status := 'queued';
+  elsif new.score >= cfg.review_score then
+    new.status := 'review';
+  else
+    new.status := 'skipped';
+    new.skip_reason := coalesce(new.skip_reason, 'score below review threshold');
+  end if;
+  new.updated_at := now();
+  return new;
+end $$ language plpgsql;
+
+drop trigger if exists trg_route_scored on jobs;
+create trigger trg_route_scored
+  before update of score on jobs
+  for each row execute function route_scored_job();
+
+-- Keep updated_at honest everywhere
+create or replace function touch_updated() returns trigger as $$
+begin new.updated_at := now(); return new; end $$ language plpgsql;
+
+drop trigger if exists trg_touch_jobs on jobs;
+create trigger trg_touch_jobs before update on jobs
+  for each row execute function touch_updated();
+drop trigger if exists trg_touch_profile on profile;
+create trigger trg_touch_profile before update on profile
+  for each row execute function touch_updated();
+
+-- ---------------------------------------------------------------------------
+-- ATOMIC CLAIM: stops two extension tabs grabbing the same job.
+-- ---------------------------------------------------------------------------
+create or replace function claim_next_job()
+returns table (id uuid, url text, apply_url text, title text, company text,
+               ats text, score int, tailored_resume text, description text)
+language plpgsql as $$
+declare cap int; done int;
+begin
+  select daily_cap into cap from search_config where id = 1;
+  select count(*) into done from jobs where applied_at::date = current_date;
+  if done >= cap then return; end if;
+
+  return query
+  with picked as (
+    select j.id from jobs j
+    where j.status = 'queued' and j.attempts < 3
+    order by j.score desc nulls last, j.found_at asc
+    limit 1
+    for update skip locked
+  )
+  update jobs j
+     set status = 'applying', attempts = j.attempts + 1, updated_at = now()
+    from picked
+   where j.id = picked.id
+  returning j.id, j.url, j.apply_url, j.title, j.company, j.ats,
+            j.score, j.tailored_resume, j.description;
+end $$;
+
+-- ---------------------------------------------------------------------------
+-- ANSWER LOOKUP: exact match, then fuzzy. Used by the extension.
+-- ---------------------------------------------------------------------------
+create or replace function find_answer(q text)
+returns table (answer text, confirmed boolean, similarity real)
+language sql stable as $$
+  select a.answer, a.confirmed, similarity(a.q_key, lower(trim(q))) as sim
+  from answers a
+  where a.q_key = lower(trim(q)) or similarity(a.q_key, lower(trim(q))) > 0.75
+  order by (a.q_key = lower(trim(q))) desc, sim desc
+  limit 1;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- ROW LEVEL SECURITY — single private user
+-- ---------------------------------------------------------------------------
+do $$
+declare t text;
+begin
+  foreach t in array array['profile','search_config','companies','jobs',
+                           'answers','emails','runs','agent']
+  loop
+    execute format('alter table %I enable row level security', t);
+    execute format('drop policy if exists owner_all on %I', t);
+    execute format(
+      'create policy owner_all on %I for all to authenticated using (true) with check (true)', t);
+  end loop;
+end $$;
+
+-- ---------------------------------------------------------------------------
+-- SEED: well-known ATS boards so discovery returns jobs on day one.
+-- Replace these with companies you actually want. Each is a free public feed.
+-- ---------------------------------------------------------------------------
+insert into companies (name, ats, token) values
+  ('Stripe','greenhouse','stripe'),
+  ('Databricks','greenhouse','databricks'),
+  ('Instacart','greenhouse','instacart'),
+  ('Robinhood','greenhouse','robinhood'),
+  ('Doximity','greenhouse','doximity'),
+  ('Cloudflare','greenhouse','cloudflare'),
+  ('Reddit','greenhouse','reddit'),
+  ('Gusto','greenhouse','gusto'),
+  ('Airtable','greenhouse','airtable'),
+  ('Discord','greenhouse','discord'),
+  ('Netflix','lever','netflix'),
+  ('Plaid','lever','plaid'),
+  ('Attentive','lever','attentive'),
+  ('Ramp','ashby','ramp'),
+  ('Linear','ashby','linear'),
+  ('Deel','ashby','deel')
+on conflict (ats, token) do nothing;
+```
+
+
+================================================================================
+  PART 2 — EDGE FUNCTIONS
+================================================================================
+
+Deploy three Supabase Edge Functions with exactly these names. Use the code
+verbatim — do not move any of this fetching logic into the frontend, because
+these APIs send no CORS headers and every browser-side request would be
+blocked.
+
+Each returns JSON shaped `{ ok, message }` or `{ ok: false, error }`. Those
+strings are written to be read by a human — display them verbatim and never
+replace them with a generic failure message.
+
+--------------------------------------------------------------------------------
+  2a. Function name:  discover
+       Pulls jobs from 8 free public sources. No API keys needed.
+--------------------------------------------------------------------------------
+
+```typescript
+
+// ============================================================================
+// discover — pulls jobs from every free public source, server-side.
+//
+// Runs on Supabase Edge Functions (Deno). Server-side matters: there is no
+// CORS, no browser fingerprint, and no bot detection on these endpoints —
+// they are public JSON feeds meant to be read by machines.
+//
+// Sources (all free, most need no key at all):
+//   greenhouse  boards-api.greenhouse.io      per company, full descriptions
+//   lever       api.lever.co                  per company, full descriptions
+//   ashby       api.ashbyhq.com               per company, incl. compensation
+//   workable    apply.workable.com            per company
+//   remotive    remotive.com/api              global remote feed
+//   remoteok    remoteok.com/api              global remote feed
+//   arbeitnow   arbeitnow.com/api             global feed
+//   usajobs     data.usajobs.gov              US federal (free key)
+//
+// Jobs from the per-company ATS sources are the highest value: they link
+// straight at the employer's own application form, which is both the most
+// reliable thing to automate and the least likely to be a reposted ghost ad.
+// ============================================================================
+
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
+
+const UA = "ApplyPilot/1.0 (job search automation; contact via app)";
+const TIMEOUT_MS = 15_000;
+
+type Job = {
+  url: string;
+  apply_url?: string;
+  title: string;
+  company?: string;
+  location?: string;
+  remote?: boolean;
+  salary_text?: string;
+  description?: string;
+  source: string;
+  ats?: string;
+  posted_at?: string;
+};
+
+// --------------------------------------------------------------------------
+// helpers
+// --------------------------------------------------------------------------
+
+async function getJSON(url: string, headers: Record<string, string> = {}) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      headers: { "User-Agent": UA, Accept: "application/json", ...headers },
+      signal: ctrl.signal,
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Strip HTML to readable text. Job descriptions arrive as HTML from most ATS. */
+function clean(html?: string | null): string {
+  if (!html) return "";
+  return html
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/(p|div|li|h[1-6])>/gi, "\n")
+    .replace(/<li[^>]*>/gi, "• ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ").replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .replace(/&#39;|&rsquo;/g, "'").replace(/&quot;|&ldquo;|&rdquo;/g, '"')
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/** Parse "$95,000-$120,000", "95k-120k", "$50/hr" into annual min/max. */
+function parseSalary(text?: string | null): { min?: number; max?: number } {
+  if (!text) return {};
+  const t = String(text).toLowerCase();
+  const hourly = /hour|hr|hourly/.test(t);
+  const nums: number[] = [];
+  for (const m of t.matchAll(/(\d[\d,]*\.?\d*)\s*(k)?/g)) {
+    let v = parseFloat(m[1].replace(/,/g, ""));
+    if (isNaN(v)) continue;
+    if (m[2]) v *= 1000;
+    if (hourly && v >= 5 && v <= 500) v *= 2080;
+    else if (v < 1000) continue;
+    if (v >= 1000 && v <= 10_000_000) nums.push(Math.round(v));
+  }
+  if (!nums.length) return {};
+  return { min: Math.min(...nums), max: Math.max(...nums) };
+}
+
+const REMOTE_RE = /\b(remote|anywhere|work from home|wfh|distributed|telecommute)\b/i;
+
+// --------------------------------------------------------------------------
+// per-company ATS sources
+// --------------------------------------------------------------------------
+
+async function greenhouse(token: string, name: string): Promise<Job[]> {
+  const data = await getJSON(
+    `https://boards-api.greenhouse.io/v1/boards/${token}/jobs?content=true`,
+  );
+  return (data.jobs ?? []).map((j: any) => ({
+    url: j.absolute_url,
+    apply_url: j.absolute_url,
+    title: j.title,
+    company: name,
+    location: j.location?.name,
+    remote: REMOTE_RE.test(j.location?.name ?? ""),
+    description: clean(j.content),
+    source: "greenhouse",
+    ats: "greenhouse",
+    posted_at: j.updated_at,
+  }));
+}
+
+async function lever(token: string, name: string): Promise<Job[]> {
+  const data = await getJSON(`https://api.lever.co/v0/postings/${token}?mode=json`);
+  return (data ?? []).map((j: any) => ({
+    url: j.hostedUrl,
+    apply_url: j.applyUrl ?? j.hostedUrl,
+    title: j.text,
+    company: name,
+    location: j.categories?.location,
+    remote: REMOTE_RE.test(j.categories?.location ?? "") ||
+            REMOTE_RE.test(j.workplaceType ?? ""),
+    salary_text: j.salaryRange
+      ? `${j.salaryRange.min}-${j.salaryRange.max} ${j.salaryRange.currency ?? ""}`
+      : undefined,
+    description: clean(j.descriptionPlain ?? j.description),
+    source: "lever",
+    ats: "lever",
+    posted_at: j.createdAt ? new Date(j.createdAt).toISOString() : undefined,
+  }));
+}
+
+async function ashby(token: string, name: string): Promise<Job[]> {
+  const data = await getJSON(
+    `https://api.ashbyhq.com/posting-api/job-board/${token}?includeCompensation=true`,
+  );
+  return (data.jobs ?? []).map((j: any) => ({
+    url: j.jobUrl,
+    apply_url: j.applyUrl ?? j.jobUrl,
+    title: j.title,
+    company: name,
+    location: j.location,
+    remote: !!j.isRemote || REMOTE_RE.test(j.location ?? ""),
+    salary_text: j.compensation?.compensationTierSummary,
+    description: clean(j.descriptionPlain ?? j.descriptionHtml),
+    source: "ashby",
+    ats: "ashby",
+    posted_at: j.publishedAt,
+  }));
+}
+
+async function workable(token: string, name: string): Promise<Job[]> {
+  const data = await getJSON(
+    `https://apply.workable.com/api/v1/widget/accounts/${token}?details=true`,
+  );
+  return (data.jobs ?? []).map((j: any) => ({
+    url: j.url ?? j.application_url,
+    apply_url: j.application_url ?? j.url,
+    title: j.title,
+    company: name,
+    location: [j.city, j.state, j.country].filter(Boolean).join(", "),
+    remote: !!j.telecommuting,
+    description: clean(j.description),
+    source: "workable",
+    ats: "workable",
+    posted_at: j.published_on,
+  }));
+}
+
+// --------------------------------------------------------------------------
+// global feeds
+// --------------------------------------------------------------------------
+
+async function remotive(q?: string): Promise<Job[]> {
+  const url = new URL("https://remotive.com/api/remote-jobs");
+  url.searchParams.set("limit", "200");
+  if (q) url.searchParams.set("search", q);
+  const data = await getJSON(url.toString());
+  return (data.jobs ?? []).map((j: any) => ({
+    url: j.url,
+    apply_url: j.url,
+    title: j.title,
+    company: j.company_name,
+    location: j.candidate_required_location || "Remote",
+    remote: true,
+    salary_text: j.salary || undefined,
+    description: clean(j.description),
+    source: "remotive",
+    posted_at: j.publication_date,
+  }));
+}
+
+async function remoteok(): Promise<Job[]> {
+  const data = await getJSON("https://remoteok.com/api");
+  return (data ?? [])
+    .filter((j: any) => j && typeof j === "object" && j.position)
+    .map((j: any) => ({
+      url: j.url ?? j.apply_url,
+      apply_url: j.apply_url ?? j.url,
+      title: j.position,
+      company: j.company,
+      location: j.location || "Remote",
+      remote: true,
+      salary_text: j.salary_min
+        ? `$${j.salary_min}-$${j.salary_max ?? j.salary_min}`
+        : undefined,
+      description: clean(j.description),
+      source: "remoteok",
+      posted_at: j.date,
+    }));
+}
+
+async function arbeitnow(): Promise<Job[]> {
+  const data = await getJSON("https://www.arbeitnow.com/api/job-board-api");
+  return (data.data ?? []).map((j: any) => ({
+    url: j.url,
+    apply_url: j.url,
+    title: j.title,
+    company: j.company_name,
+    location: j.location || (j.remote ? "Remote" : undefined),
+    remote: !!j.remote,
+    description: clean(j.description),
+    source: "arbeitnow",
+    posted_at: j.created_at ? new Date(j.created_at * 1000).toISOString() : undefined,
+  }));
+}
+
+async function usajobs(q: string, loc?: string): Promise<Job[]> {
+  const key = Deno.env.get("USAJOBS_API_KEY");
+  const email = Deno.env.get("USAJOBS_EMAIL");
+  if (!key || !email) return [];
+
+  const url = new URL("https://data.usajobs.gov/api/search");
+  url.searchParams.set("Keyword", q);
+  url.searchParams.set("ResultsPerPage", "100");
+  if (loc && !REMOTE_RE.test(loc)) url.searchParams.set("LocationName", loc);
+
+  const data = await getJSON(url.toString(), {
+    Host: "data.usajobs.gov",
+    "User-Agent": email,
+    "Authorization-Key": key,
+  });
+
+  return (data.SearchResult?.SearchResultItems ?? []).map((item: any) => {
+    const d = item.MatchedObjectDescriptor ?? {};
+    const pay = (d.PositionRemuneration ?? [])[0] ?? {};
+    const salary = pay.MinimumRange
+      ? `$${Math.round(+pay.MinimumRange).toLocaleString()}-$${Math.round(+(pay.MaximumRange ?? pay.MinimumRange)).toLocaleString()}`
+      : undefined;
+    return {
+      url: d.PositionURI,
+      apply_url: (d.ApplyURI ?? [])[0] ?? d.PositionURI,
+      title: d.PositionTitle,
+      company: d.OrganizationName,
+      location: (d.PositionLocation ?? [])[0]?.LocationName,
+      remote: false,
+      salary_text: salary,
+      description: clean(d.UserArea?.Details?.JobSummary ?? d.QualificationSummary),
+      source: "usajobs",
+      ats: "usajobs",
+      posted_at: d.PublicationStartDate,
+    };
+  });
+}
+
+// --------------------------------------------------------------------------
+// filtering — free, runs before anything costs a token
+// --------------------------------------------------------------------------
+
+function wordHit(haystack: string, needle: string): boolean {
+  const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?<!\\w)${escaped}(?!\\w)`, "i").test(haystack);
+}
+
+function keep(job: Job, cfg: any): { ok: boolean; why?: string } {
+  const title = (job.title ?? "").toLowerCase();
+  const blob = `${title}\n${(job.description ?? "").slice(0, 4000)}`.toLowerCase();
+
+  if (!job.url || !job.title) return { ok: false, why: "missing url or title" };
+
+  for (const bad of cfg.exclude_titles ?? []) {
+    if (bad && wordHit(title, bad.toLowerCase())) {
+      return { ok: false, why: `excluded title: ${bad}` };
+    }
+  }
+  for (const bad of cfg.exclude_companies ?? []) {
+    if (bad && (job.company ?? "").toLowerCase().includes(bad.toLowerCase())) {
+      return { ok: false, why: `blocked company: ${job.company}` };
+    }
+  }
+  for (const pat of cfg.no_go_patterns ?? []) {
+    if (pat && blob.includes(pat.toLowerCase())) {
+      return { ok: false, why: `no-go pattern: ${pat}` };
+    }
+  }
+
+  // Title relevance: at least one target title word must appear. Without this
+  // the global feeds flood the queue with thousands of unrelated postings.
+  const titles: string[] = cfg.titles ?? [];
+  if (titles.length) {
+    const hit = titles.some((t: string) => {
+      const words = t.toLowerCase().split(/\s+/).filter((w) => w.length > 2);
+      if (!words.length) return false;
+      const matched = words.filter((w) => title.includes(w)).length;
+      return matched / words.length >= 0.5;   // half the words of any target title
+    });
+    if (!hit) return { ok: false, why: "title not relevant to targets" };
+  }
+
+  // Salary floor — jobs with no stated salary always pass, because most
+  // postings omit it and filtering them would delete the majority of the market.
+  const { min, max } = parseSalary(job.salary_text);
+  const floor = cfg.salary_floor ?? 0;
+  if (floor > 0 && min != null) {
+    if ((max ?? min) < floor) return { ok: false, why: `below salary floor` };
+  }
+
+  // Location
+  const locs: string[] = cfg.locations ?? [];
+  if (locs.length && job.location) {
+    const loc = job.location.toLowerCase();
+    const remoteOk = cfg.remote_ok !== false;
+    const isRemote = job.remote || REMOTE_RE.test(loc);
+
+    if (!(isRemote && remoteOk)) {
+      // Compare only against real places. A "Remote" entry in the config
+      // describes remote jobs, not a city — matching it against an on-site
+      // job let every location through, which silently defeated the filter.
+      const cities = locs
+        .filter((l) => !REMOTE_RE.test(l))
+        .map((l) => l.toLowerCase().split(",")[0].trim())
+        .filter(Boolean);
+
+      if (cities.length === 0) {
+        // Config is remote-only and this job is not remote.
+        return { ok: false, why: `not remote: ${job.location}` };
+      }
+      if (!cities.some((city) => loc.includes(city))) {
+        return { ok: false, why: `location: ${job.location}` };
+      }
+    }
+  }
+
+  return { ok: true };
+}
+
+// --------------------------------------------------------------------------
+// handler
+// --------------------------------------------------------------------------
+
+Deno.serve(async (req) => {
+  const cors = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  };
+  if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
+
+  const supabase = createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
+  );
+
+  const { data: run } = await supabase
+    .from("runs").insert({ kind: "discover" }).select().single();
+
+  const stats = { found: 0, kept: 0, inserted: 0, filtered: 0, errors: 0 };
+  const bySource: Record<string, number> = {};
+  const problems: string[] = [];
+
+  try {
+    const { data: cfg } = await supabase
+      .from("search_config").select("*").eq("id", 1).single();
+    if (!cfg) throw new Error("search_config row missing");
+    if (!cfg.titles?.length) {
+      throw new Error(
+        "No job titles configured. Add at least one in Settings → Search, " +
+        "or every source returns thousands of irrelevant postings.",
+      );
+    }
+
+    const enabled: string[] = cfg.sources ?? [];
+    const all: Job[] = [];
+
+    // --- per-company ATS boards (highest value) ---
+    const { data: companies } = await supabase
+      .from("companies").select("*").eq("enabled", true);
+
+    const fetchers: Record<string, (t: string, n: string) => Promise<Job[]>> = {
+      greenhouse, lever, ashby, workable,
+    };
+
+    // Bounded concurrency: polite to the APIs, still fast.
+    const list = (companies ?? []).filter((c) => enabled.includes(c.ats));
+    const BATCH = 6;
+    for (let i = 0; i < list.length; i += BATCH) {
+      const slice = list.slice(i, i + BATCH);
+      const results = await Promise.allSettled(
+        slice.map((c) => fetchers[c.ats]?.(c.token, c.name) ?? Promise.resolve([])),
+      );
+      results.forEach((r, idx) => {
+        const c = slice[idx];
+        if (r.status === "fulfilled") {
+          all.push(...r.value);
+          bySource[c.ats] = (bySource[c.ats] ?? 0) + r.value.length;
+          supabase.from("companies")
+            .update({ last_pulled: new Date().toISOString(), job_count: r.value.length })
+            .eq("id", c.id).then(() => {});
+        } else {
+          stats.errors++;
+          problems.push(`${c.ats}:${c.token} — ${r.reason?.message ?? r.reason}`);
+        }
+      });
+    }
+
+    // --- global feeds ---
+    const globals: Array<[string, () => Promise<Job[]>]> = [];
+    if (enabled.includes("remotive")) {
+      for (const t of (cfg.titles ?? []).slice(0, 3)) {
+        globals.push([`remotive`, () => remotive(t)]);
+      }
+    }
+    if (enabled.includes("remoteok")) globals.push(["remoteok", remoteok]);
+    if (enabled.includes("arbeitnow")) globals.push(["arbeitnow", arbeitnow]);
+    if (enabled.includes("usajobs")) {
+      for (const t of (cfg.titles ?? []).slice(0, 3)) {
+        globals.push(["usajobs", () => usajobs(t, (cfg.locations ?? [])[0])]);
+      }
+    }
+
+    const gres = await Promise.allSettled(globals.map(([, fn]) => fn()));
+    gres.forEach((r, i) => {
+      const name = globals[i][0];
+      if (r.status === "fulfilled") {
+        all.push(...r.value);
+        bySource[name] = (bySource[name] ?? 0) + r.value.length;
+      } else {
+        stats.errors++;
+        problems.push(`${name} — ${r.reason?.message ?? r.reason}`);
+      }
+    });
+
+    stats.found = all.length;
+
+    // --- filter + dedupe ---
+    const seen = new Set<string>();
+    const rows: any[] = [];
+    for (const j of all) {
+      if (!j.url || seen.has(j.url)) continue;
+      seen.add(j.url);
+      const verdict = keep(j, cfg);
+      if (!verdict.ok) { stats.filtered++; continue; }
+      const { min, max } = parseSalary(j.salary_text);
+      rows.push({
+        url: j.url,
+        apply_url: j.apply_url ?? j.url,
+        title: j.title,
+        company: j.company,
+        location: j.location,
+        remote: !!j.remote,
+        salary_text: j.salary_text,
+        salary_min: min, salary_max: max,
+        description: (j.description ?? "").slice(0, 20000),
+        source: j.source,
+        ats: j.ats,
+        posted_at: j.posted_at,
+        status: "new",
+      });
+    }
+    stats.kept = rows.length;
+
+    // --- insert, ignoring anything already seen ---
+    for (let i = 0; i < rows.length; i += 500) {
+      const chunk = rows.slice(i, i + 500);
+      const { data, error } = await supabase
+        .from("jobs")
+        .upsert(chunk, { onConflict: "url", ignoreDuplicates: true })
+        .select("id");
+      if (error) { stats.errors++; problems.push(`insert: ${error.message}`); }
+      else stats.inserted += data?.length ?? 0;
+    }
+
+    const message = stats.inserted > 0
+      ? `${stats.inserted} new jobs from ${Object.keys(bySource).length} sources`
+      : stats.found === 0
+        ? "No sources returned any jobs. Check Settings → Companies has entries, " +
+          "and that your enabled sources are correct."
+        : `Found ${stats.found} postings but kept 0 — every one was filtered out. ` +
+          `Most likely your job titles are too specific, or your exclude list is too broad.`;
+
+    await supabase.from("runs").update({
+      status: "done", found: stats.found, processed: stats.inserted,
+      errors: stats.errors,
+      detail: { by_source: bySource, filtered: stats.filtered, problems: problems.slice(0, 20) },
+      message, ended_at: new Date().toISOString(),
+    }).eq("id", run!.id);
+
+    return new Response(JSON.stringify({ ok: true, ...stats, by_source: bySource, message }), {
+      headers: { ...cors, "Content-Type": "application/json" },
+    });
+  } catch (e) {
+    await supabase.from("runs").update({
+      status: "error", message: String(e?.message ?? e),
+      errors: stats.errors + 1, ended_at: new Date().toISOString(),
+    }).eq("id", run!.id);
+    return new Response(JSON.stringify({ ok: false, error: String(e?.message ?? e) }), {
+      status: 500, headers: { ...cors, "Content-Type": "application/json" },
+    });
+  }
+});
+```
+
+--------------------------------------------------------------------------------
+  2b. Function name:  score
+       Rates jobs against the resume and tailors the good ones.
+       Needs secret: GEMINI_API_KEY
+--------------------------------------------------------------------------------
+
+```typescript
+
+// ============================================================================
+// score — rates unscored jobs against the resume, then tailors the winners.
+//
+// Batched 20 jobs per model call. Scoring one job per call is what makes
+// these systems expensive: discovery can surface thousands of postings a day,
+// and at one request each the free tier is gone before anything gets applied
+// to. Sending the resume once and scoring twenty postings against it costs a
+// twentieth as much and leaves the quota for tailoring, which is the step
+// that actually produces an application.
+//
+// Model: Gemini Flash free tier. No credit card, no billing, ~1,500 requests
+// per day. Exceeding it returns HTTP 429 — it never charges.
+// ============================================================================
+
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
+
+const MODEL = Deno.env.get("GEMINI_MODEL") ?? "gemini-2.0-flash";
+const BATCH = 20;
+const MAX_BATCHES = 12;        // ceiling per invocation; cron calls it again
+
+async function gemini(prompt: string, maxTokens = 8192): Promise<string> {
+  const key = Deno.env.get("GEMINI_API_KEY");
+  if (!key) throw new Error("GEMINI_API_KEY is not set in Edge Function secrets");
+
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${key}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.2, maxOutputTokens: maxTokens },
+      }),
+    },
+  );
+
+  if (res.status === 429) {
+    throw new Error(
+      "RATE_LIMIT: Gemini free-tier quota reached for today. Scoring resumes " +
+      "automatically tomorrow — nothing was charged.",
+    );
+  }
+  if (!res.ok) throw new Error(`Gemini HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
+
+  const data = await res.json();
+  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) throw new Error("Gemini returned no text");
+  return text;
+}
+
+/** Pull a JSON array out of a model response that may be fenced or chatty. */
+function extractArray(text: string): any[] | null {
+  const fenced = text.match(/```(?:json)?\s*(\[[\s\S]*?\])\s*```/);
+  const raw = fenced?.[1] ?? text.match(/\[[\s\S]*\]/)?.[0];
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function extractObject(text: string): any | null {
+  const fenced = text.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/);
+  const raw = fenced?.[1] ?? text.match(/\{[\s\S]*\}/)?.[0];
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
+const SCORE_PROMPT = `You rate how well one candidate fits each job posting.
+
+Scoring:
+ 9-10  Direct experience in nearly everything required.
+ 7-8   Most requirements met, small gaps that are easily bridged.
+ 5-6   Real overlap but missing some key requirements.
+ 3-4   Significant gaps, would need substantial ramp-up.
+ 1-2   Wrong field or wrong level entirely.
+
+Be realistic about seniority and years of experience. Credit transferable
+experience. Do not inflate scores to be encouraging — a wrong score wastes
+an application.
+
+Return ONLY a JSON array, one object per job, in the SAME ORDER given, with
+every job present exactly once. Keys: "n" (the job number), "score" (1-10
+integer), "reason" (one sentence). No text outside the array.`;
+
+const TAILOR_PROMPT = `Rewrite this candidate's resume for this specific job.
+
+ABSOLUTE RULES:
+- Never invent employers, job titles, dates, degrees, certifications or metrics.
+- Keep every real employer and date exactly as given.
+- You may reorder, re-emphasise, and rewrite bullet wording to mirror the
+  job's language. You may drop irrelevant detail. You may not add anything
+  the candidate did not do.
+- Mirror the posting's own vocabulary where it honestly matches their
+  experience — that is what gets past keyword screening.
+
+Return ONLY JSON with these keys:
+  "summary": 2-3 sentence professional summary aimed at this job
+  "skills": object of category -> comma-separated string
+  "experience": array of { "company", "title", "dates", "bullets": [string] }
+  "education": array of { "school", "degree", "dates" }
+No text outside the JSON.`;
+
+function renderResume(data: any, profile: any): string {
+  const out: string[] = [];
+  out.push(profile.full_name ?? "");
+  if (profile.target_role) out.push(profile.target_role);
+  const contact = [profile.email, profile.phone,
+    [profile.city, profile.state].filter(Boolean).join(", "),
+    profile.linkedin_url].filter(Boolean).join(" | ");
+  if (contact) out.push(contact);
+  out.push("");
+
+  if (data.summary) { out.push("SUMMARY", String(data.summary), ""); }
+
+  if (data.skills && typeof data.skills === "object") {
+    out.push("SKILLS");
+    for (const [k, v] of Object.entries(data.skills)) out.push(`${k}: ${v}`);
+    out.push("");
+  }
+
+  if (Array.isArray(data.experience) && data.experience.length) {
+    out.push("EXPERIENCE");
+    for (const e of data.experience) {
+      const head = [e.company, e.title].filter(Boolean).join(" - ");
+      out.push(e.dates ? `${head} (${e.dates})` : head);
+      for (const b of e.bullets ?? []) out.push(`- ${String(b).replace(/^[-•*]\s*/, "")}`);
+      out.push("");
+    }
+  }
+
+  if (Array.isArray(data.education) && data.education.length) {
+    out.push("EDUCATION");
+    for (const e of data.education) {
+      const line = [e.school, e.degree].filter(Boolean).join(" - ");
+      out.push(e.dates ? `${line} (${e.dates})` : line);
+    }
+  }
+  return out.join("\n").trim();
+}
+
+Deno.serve(async (req) => {
+  const cors = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  };
+  if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
+
+  const supabase = createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
+  );
+  const { data: run } = await supabase.from("runs").insert({ kind: "score" }).select().single();
+
+  const stats = { scored: 0, tailored: 0, errors: 0 };
+  let note = "";
+
+  try {
+    const { data: profile } = await supabase.from("profile").select("*").eq("id", 1).single();
+    if (!profile?.resume_text?.trim()) {
+      throw new Error("No resume yet. Upload one in Settings → Profile before scoring.");
+    }
+    const resume = profile.resume_text.slice(0, 8000);
+
+    // ---------------- score ----------------
+    for (let b = 0; b < MAX_BATCHES; b++) {
+      const { data: batch } = await supabase
+        .from("jobs").select("id,title,company,location,salary_text,description")
+        .is("score", null).eq("status", "new")
+        .order("found_at", { ascending: false })
+        .limit(BATCH);
+      if (!batch?.length) break;
+
+      const listing = batch.map((j, i) =>
+        `--- JOB ${i + 1} ---\nTITLE: ${j.title}\nCOMPANY: ${j.company ?? "?"}\n` +
+        `LOCATION: ${j.location ?? "?"}\nSALARY: ${j.salary_text ?? "not listed"}\n` +
+        `DESCRIPTION:\n${(j.description ?? "").slice(0, 1800)}`
+      ).join("\n\n");
+
+      let parsed: any[] | null = null;
+      try {
+        const text = await gemini(
+          `${SCORE_PROMPT}\n\nCANDIDATE RESUME:\n${resume}\n\n` +
+          `=== ${batch.length} JOBS ===\n\n${listing}`,
+          Math.min(8192, batch.length * 160 + 512),
+        );
+        parsed = extractArray(text);
+      } catch (e) {
+        if (String(e.message).startsWith("RATE_LIMIT")) { note = e.message; break; }
+        throw e;
+      }
+
+      // A batch is only trusted when every job came back. A partial response
+      // would attach the wrong score to the wrong job and silently mis-rank
+      // the whole queue, which is worse than not scoring at all.
+      if (!parsed || parsed.length !== batch.length) {
+        stats.errors++;
+        note = "A scoring batch came back incomplete and was skipped.";
+        continue;
+      }
+
+      const byIndex = new Map<number, any>();
+      for (const item of parsed) {
+        const n = Number(item?.n);
+        if (Number.isInteger(n) && n >= 1 && n <= batch.length) byIndex.set(n, item);
+      }
+      if (byIndex.size !== batch.length) { stats.errors++; continue; }
+
+      for (let i = 0; i < batch.length; i++) {
+        const r = byIndex.get(i + 1);
+        const score = Math.max(1, Math.min(10, Math.round(Number(r.score) || 1)));
+        // The DB trigger routes this to queued / review / skipped.
+        await supabase.from("jobs").update({
+          score, score_reason: String(r.reason ?? "").slice(0, 500),
+          scored_at: new Date().toISOString(),
+        }).eq("id", batch[i].id);
+        stats.scored++;
+      }
+    }
+
+    // ---------------- tailor the queued ones ----------------
+    if (!note.startsWith("RATE_LIMIT")) {
+      const { data: queued } = await supabase
+        .from("jobs").select("id,title,company,description")
+        .eq("status", "queued").is("tailored_resume", null)
+        .order("score", { ascending: false }).limit(10);
+
+      for (const job of queued ?? []) {
+        try {
+          const text = await gemini(
+            `${TAILOR_PROMPT}\n\nJOB: ${job.title} at ${job.company ?? ""}\n` +
+            `POSTING:\n${(job.description ?? "").slice(0, 4000)}\n\n` +
+            `CANDIDATE RESUME:\n${resume}`,
+            3072,
+          );
+          const data = extractObject(text);
+          if (!data?.experience) { stats.errors++; continue; }
+          await supabase.from("jobs").update({
+            tailored_resume: renderResume(data, profile),
+            tailored_at: new Date().toISOString(),
+          }).eq("id", job.id);
+          stats.tailored++;
+        } catch (e) {
+          if (String(e.message).startsWith("RATE_LIMIT")) { note = e.message; break; }
+          stats.errors++;
+        }
+      }
+    }
+
+    const message = note ||
+      (stats.scored === 0 && stats.tailored === 0
+        ? "Nothing to score — no new jobs waiting. Run discover first."
+        : `Scored ${stats.scored}, tailored ${stats.tailored}`);
+
+    await supabase.from("runs").update({
+      status: "done", processed: stats.scored, errors: stats.errors,
+      detail: stats, message, ended_at: new Date().toISOString(),
+    }).eq("id", run!.id);
+
+    return new Response(JSON.stringify({ ok: true, ...stats, message }), {
+      headers: { ...cors, "Content-Type": "application/json" },
+    });
+  } catch (e) {
+    await supabase.from("runs").update({
+      status: "error", message: String(e?.message ?? e),
+      errors: stats.errors + 1, ended_at: new Date().toISOString(),
+    }).eq("id", run!.id);
+    return new Response(JSON.stringify({ ok: false, error: String(e?.message ?? e) }), {
+      status: 500, headers: { ...cors, "Content-Type": "application/json" },
+    });
+  }
+});
+```
+
+--------------------------------------------------------------------------------
+  2c. Function name:  run-apply
+       Starts the applier workflow. Needs secrets: GITHUB_TOKEN, GITHUB_REPO
+--------------------------------------------------------------------------------
+
+```typescript
+
+// ============================================================================
+// run-apply — fires the cloud agent from the panel.
+//
+// The applier runs on GitHub Actions. This function is the trigger: it sends
+// a repository_dispatch event, which starts the workflow.
+//
+// It exists as an Edge Function rather than a fetch from the browser because
+// it needs a GitHub token, and a token in the frontend bundle is a token
+// anyone who opens devtools can use to push code to your repository.
+// ============================================================================
+
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
+
+Deno.serve(async (req) => {
+  const cors = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  };
+  if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
+
+  const json = (body: unknown, status = 200) =>
+    new Response(JSON.stringify(body), {
+      status, headers: { ...cors, "Content-Type": "application/json" },
+    });
+
+  const token = Deno.env.get("GITHUB_TOKEN");
+  const repo = Deno.env.get("GITHUB_REPO");          // e.g. "succincc/applypilot-agent"
+
+  if (!token || !repo) {
+    return json({
+      ok: false,
+      error: "Cloud agent not configured. Set GITHUB_TOKEN and GITHUB_REPO as " +
+             "Edge Function secrets — see 04-CLOUD-AGENT.txt.",
+    }, 400);
+  }
+
+  let maxJobs = 25;
+  let dryRun = false;
+  try {
+    const body = await req.json();
+    if (Number.isInteger(body?.max_jobs)) maxJobs = Math.min(100, Math.max(1, body.max_jobs));
+    dryRun = body?.dry_run === true;
+  } catch { /* defaults are fine */ }
+
+  const supabase = createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
+  );
+
+  // Don't start a run with nothing to do — a workflow that finds an empty
+  // queue looks identical to a workflow that is broken.
+  const { count } = await supabase
+    .from("jobs").select("id", { count: "exact", head: true }).eq("status", "queued");
+
+  if (!count) {
+    return json({
+      ok: false,
+      error: "Queue is empty. Run discovery, then scoring — scoring is what " +
+             "moves good jobs into the queue.",
+    }, 400);
+  }
+
+  const res = await fetch(`https://api.github.com/repos/${repo}/dispatches`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "Content-Type": "application/json",
+      "User-Agent": "ApplyPilot",
+    },
+    body: JSON.stringify({
+      event_type: "apply",
+      client_payload: { max_jobs: maxJobs, dry_run: dryRun },
+    }),
+  });
+
+  // GitHub answers 204 with no body on success.
+  if (res.status === 204) {
+    await supabase.from("runs").insert({
+      kind: "apply", status: "running",
+      message: `cloud agent dispatched — up to ${maxJobs} job(s)${dryRun ? " (dry run)" : ""}`,
+    });
+    return json({
+      ok: true,
+      message: `Cloud agent started on ${count} queued job(s). ` +
+               `It takes a minute or two to boot; progress appears here as it works.`,
+    });
+  }
+
+  const detail = (await res.text()).slice(0, 300);
+  const hint =
+    res.status === 404
+      ? "Repository not found, or the token cannot see it. Check GITHUB_REPO is " +
+        "owner/name and the token has Actions: Read and write on that repo."
+      : res.status === 401 || res.status === 403
+        ? "GitHub rejected the token. It may be expired or missing the Actions permission."
+        : "";
+
+  return json({ ok: false, error: `GitHub ${res.status}. ${hint} ${detail}`.trim() }, 502);
+});
+```
+
+
+================================================================================
+  PART 3 — THE APPLIER
+================================================================================
+
+Commit these two files to THIS repository, at exactly these paths. They are not
+part of the React app and must not be imported by it — GitHub Actions runs them
+on its own servers.
+
+Putting them here rather than in a separate repo is deliberate: it means the
+user never has to create or manage a second repository.
+
+--------------------------------------------------------------------------------
+  3a. Path:  apply.mjs            (repository root)
+--------------------------------------------------------------------------------
+
+```javascript
+
+// ============================================================================
+// apply.mjs — the cloud applier.
+//
+// Runs on GitHub Actions with Playwright. This is what makes the whole system
+// work from a phone: you press a button in the panel, GitHub runs this, and
+// applications get submitted. Your computer is never involved.
+//
+// Why GitHub Actions: it is the only free way to get a real browser running
+// in the cloud on a schedule. Public repositories get unlimited runner
+// minutes. No resume or personal data lives in this repo — everything is
+// pulled from Supabase at runtime using a secret, so the repo can be public
+// and still hold nothing about you.
+//
+// The field-matching logic below is deliberately the same approach as the
+// Chrome extension: identify fields by the LABEL a human reads, not by CSS
+// selectors, because every ATS uses different markup but all of them show a
+// person "First Name".
+// ============================================================================
+
+import { chromium } from "playwright";
+
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+const MAX_JOBS = parseInt(process.env.MAX_JOBS || "25", 10);
+const DRY_RUN = process.env.DRY_RUN === "true";
+
+if (!SUPABASE_URL || !SERVICE_KEY) {
+  console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_KEY secret.");
+  process.exit(1);
+}
+
+// ---------------------------------------------------------------------------
+// Supabase REST
+// ---------------------------------------------------------------------------
+async function db(path, init = {}) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+    ...init,
+    headers: {
+      apikey: SERVICE_KEY,
+      Authorization: `Bearer ${SERVICE_KEY}`,
+      "Content-Type": "application/json",
+      ...(init.headers || {}),
+    },
+  });
+  if (!res.ok) throw new Error(`DB ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : null;
+}
+
+const rpc = (fn, args = {}) =>
+  db(`rpc/${fn}`, { method: "POST", body: JSON.stringify(args) });
+
+const patchJob = (id, patch) =>
+  db(`jobs?id=eq.${id}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify({ ...patch, updated_at: new Date().toISOString() }),
+  });
+
+/** Report status so the panel can show the cloud agent as alive.
+ *
+ * Without this the dashboard reads the `agent` table — written only by the
+ * Chrome extension — and shows "offline" the whole time the cloud agent is
+ * working, which looks exactly like the system being broken. */
+const heartbeat = (patch) =>
+  db("agent?id=eq.1", {
+    method: "PATCH",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify({
+      last_seen: new Date().toISOString(),
+      version: "cloud-agent",
+      ...patch,
+    }),
+  }).catch(() => {});
+
+// ---------------------------------------------------------------------------
+// Field matching — shared logic with the extension.
+//
+// Word-boundary matching is not a nicety here. Plain substring matching put
+// "FL" into "Are you legally authorized to work in the United States?"
+// (because "state" is inside "States") and "Tampa" into "Race / ethnicity"
+// (because "city" is inside "ethnicity"). Both went onto live applications.
+// ---------------------------------------------------------------------------
+function has(label, ...needles) {
+  return needles.some((n) => {
+    const escaped = n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`(?<![a-z])${escaped}(?![a-z])`, "i").test(label);
+  });
+}
+
+/** Questions the form is ASKING. Checked before field-name matching. */
+function answerQuestion(label, p) {
+  if (has(label, "authorized to work", "legally authorized", "work authorization",
+                 "eligible to work", "right to work")) return p.work_authorized;
+  if (has(label, "sponsorship", "visa", "h-1b", "h1b", "work permit")) return p.needs_sponsorship;
+  if (has(label, "18 years", "over 18", "age of majority", "at least 18")) return p.over_18;
+  if (has(label, "background check", "drug screen", "drug test")) return p.can_background_check;
+  if (has(label, "relocate", "relocation")) return p.willing_to_relocate;
+  if (has(label, "veteran", "protected veteran")) return p.veteran_status;
+  if (has(label, "disability", "disabled")) return p.disability_status;
+  if (has(label, "gender", "sex", "pronouns")) return p.gender;
+  if (has(label, "race", "ethnicity", "hispanic", "latino")) return p.race_ethnicity;
+  if (has(label, "previously worked", "former employee", "worked here before")) return "No";
+  if (has(label, "convicted", "felony", "criminal", "conviction")) return "No";
+  if (has(label, "non-compete", "noncompete")) return "No";
+  return null;
+}
+
+function fieldValue(label, p) {
+  if (has(label, "first name", "given name", "forename")) return p.first_name;
+  if (has(label, "last name", "surname", "family name")) return p.last_name;
+  if (has(label, "preferred name", "nickname")) return p.preferred_name || p.first_name;
+  if (has(label, "full name", "your name", "legal name")) return p.full_name;
+  if (has(label, "email", "e-mail")) return p.email;
+  if (has(label, "phone", "mobile", "telephone", "cell")) return p.phone;
+  if (has(label, "linkedin")) return p.linkedin_url;
+  if (has(label, "github")) return p.github_url;
+  if (has(label, "portfolio", "website", "personal site")) return p.portfolio_url;
+  if (has(label, "street", "address line 1", "address 1")) return p.address;
+  if (has(label, "address") && !has(label, "email", "e-mail")) return p.address;
+  if (has(label, "city", "town")) return p.city;
+  if (has(label, "state", "province", "region") && !has(label, "united states")) return p.state;
+  if (has(label, "zip", "postal", "postcode")) return p.postal_code;
+  if (has(label, "country")) return p.country;
+  if (has(label, "location") && !has(label, "relocate")) {
+    return [p.city, p.state].filter(Boolean).join(", ");
+  }
+  if (has(label, "current company", "current employer")) return p.current_company;
+  if (has(label, "current title", "current role", "job title", "position title")) return p.target_role;
+  if (has(label, "years of experience", "years experience", "how many years")) return p.years_experience;
+  if (has(label, "school", "university", "college")) return p.school;
+  if (has(label, "degree", "education level", "highest level")) return p.education_level;
+  if (has(label, "desired salary", "salary expectation", "expected salary",
+                 "expected compensation", "salary requirement", "desired compensation",
+                 "target salary")) {
+    return p.salary_expectation != null ? String(p.salary_expectation) : null;
+  }
+  if (has(label, "notice period")) return "2 weeks";
+  if (has(label, "start date", "available", "when can you start", "earliest")) return p.earliest_start;
+  if (has(label, "how did you hear", "referral source", "referred by")) return "Company website";
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Read a control's label the way a person reads it
+// ---------------------------------------------------------------------------
+const LABEL_SCRIPT = `(el) => {
+  const parts = [];
+  if (el.id) {
+    const lab = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
+    if (lab) parts.push(lab.innerText);
+  }
+  const wrap = el.closest('label');
+  if (wrap) parts.push(wrap.innerText);
+  for (const a of ['aria-label','placeholder','name','id','data-qa','title']) {
+    const v = el.getAttribute && el.getAttribute(a);
+    if (v) parts.push(v);
+  }
+  const lb = el.getAttribute && el.getAttribute('aria-labelledby');
+  if (lb) for (const id of lb.split(/\\s+/)) {
+    const n = document.getElementById(id); if (n) parts.push(n.innerText);
+  }
+  let probe = el.parentElement;
+  for (let d = 0; probe && d < 3; d++, probe = probe.parentElement) {
+    const t = Array.from(probe.childNodes)
+      .filter(n => n.nodeType === 3)
+      .map(n => n.textContent.trim())
+      .filter(t => t.length > 2 && t.length < 160).join(' ');
+    if (t) { parts.push(t); break; }
+  }
+  return parts.join(' ').replace(/\\s+/g,' ').replace(/\\*/g,'').trim().toLowerCase();
+}`;
+
+// ---------------------------------------------------------------------------
+// Apply to one job
+// ---------------------------------------------------------------------------
+async function applyToJob(context, job, profile, answers) {
+  const page = await context.newPage();
+  const answerMap = new Map((answers || []).map((a) => [a.q_key, a.answer]));
+  const lookupSaved = (label) => {
+    if (answerMap.has(label)) return answerMap.get(label);
+    for (const [k, v] of answerMap) {
+      if (k.length > 12 && (label.includes(k) || k.includes(label))) return v;
+    }
+    return null;
+  };
+
+  const unknown = [];
+  let filled = 0;
+
+  try {
+    await page.goto(job.apply_url || job.url, {
+      waitUntil: "domcontentloaded", timeout: 45000,
+    });
+    await page.waitForTimeout(2500);
+
+    // --- blockers, before touching anything ---
+    const body = (await page.innerText("body").catch(() => "")).toLowerCase();
+    if (/no longer accepting|position (has been )?filled|posting (is )?closed|expired/.test(body)) {
+      return { status: "skipped", skip_reason: "posting closed" };
+    }
+    if (/already applied|you have applied/.test(body)) {
+      return { status: "applied", note: "already applied previously" };
+    }
+    const captcha = await page.$(".g-recaptcha, .h-captcha, .cf-turnstile, iframe[src*='recaptcha'], iframe[src*='hcaptcha']");
+    if (captcha) return { status: "needs_help", help_reason: "captcha" };
+    if (await page.$("input[type=password]")) {
+      return { status: "needs_help", help_reason: "login" };
+    }
+
+    // --- resume file: write it to disk and attach it ---
+    // A cloud browser CAN set a file input (unlike a Chrome extension, where
+    // only a human gesture can). This is the main thing the cloud agent does
+    // that the extension cannot.
+    const fileInputs = await page.$$("input[type=file]");
+    if (fileInputs.length && job.tailored_resume) {
+      const { writeFileSync } = await import("node:fs");
+      const path = `/tmp/resume_${job.id}.txt`;
+      writeFileSync(path, job.tailored_resume, "utf8");
+      for (const input of fileInputs.slice(0, 1)) {
+        await input.setInputFiles(path).catch(() => {});
+      }
+      await page.waitForTimeout(3000);   // ATS parse the upload
+    }
+
+    // --- fill, across multiple pages if needed ---
+    for (let step = 0; step < 6; step++) {
+      const controls = await page.$$("input, select, textarea");
+
+      for (const el of controls) {
+        try {
+          const type = await el.getAttribute("type");
+          if (["hidden", "submit", "button", "file", "image", "reset"].includes(type)) continue;
+          if (!(await el.isVisible().catch(() => false))) continue;
+          if (!(await el.isEnabled().catch(() => false))) continue;
+
+          const name = (await el.getAttribute("name")) || "";
+          if (/honeypot|bot[-_]?field|leave[-_]?blank/i.test(name)) continue;
+
+          const label = await el.evaluate(LABEL_SCRIPT);
+          if (!label) continue;
+
+          const tag = await el.evaluate((e) => e.tagName);
+
+          // checkboxes: only consent boxes
+          if (type === "checkbox") {
+            if (has(label, "agree", "consent", "acknowledge", "certify",
+                           "terms", "privacy", "accurate")) {
+              if (!(await el.isChecked())) { await el.check({ timeout: 3000 }).catch(() => {}); filled++; }
+            }
+            continue;
+          }
+
+          if (type === "radio") {
+            const want = answerQuestion(label, profile) ?? lookupSaved(label);
+            if (!want) continue;
+            const val = (await el.getAttribute("value")) || "";
+            if (label.includes(String(want).toLowerCase()) ||
+                val.toLowerCase() === String(want).toLowerCase()) {
+              await el.check({ timeout: 3000 }).catch(() => {});
+              filled++;
+            }
+            continue;
+          }
+
+          if (tag === "SELECT") {
+            const current = await el.inputValue().catch(() => "");
+            if (current) continue;
+            const want = answerQuestion(label, profile) ?? fieldValue(label, profile) ?? lookupSaved(label);
+            if (!want) {
+              unknown.push({ question: label.slice(0, 200), type: "select" });
+              continue;
+            }
+            const ok = await el.selectOption({ label: String(want) }).then(() => true).catch(() => false);
+            if (!ok) {
+              // fall back to a loose text match over the options
+              const matched = await el.evaluate((sel, target) => {
+                const t = String(target).toLowerCase();
+                const o = Array.from(sel.options).find(
+                  (o) => o.value && o.text.toLowerCase().includes(t));
+                if (o) { sel.value = o.value;
+                  sel.dispatchEvent(new Event("change", { bubbles: true })); return true; }
+                return false;
+              }, want);
+              if (matched) filled++;
+              else unknown.push({ question: label.slice(0, 200), type: "select" });
+            } else filled++;
+            continue;
+          }
+
+          // text-ish
+          const existing = await el.inputValue().catch(() => "");
+          if (existing && existing.trim()) continue;
+          const want = answerQuestion(label, profile) ?? fieldValue(label, profile) ?? lookupSaved(label);
+          if (want) {
+            await el.fill(String(want), { timeout: 5000 }).catch(() => {});
+            filled++;
+          } else if (tag === "TEXTAREA") {
+            unknown.push({ question: label.slice(0, 200), type: "longtext" });
+          } else if (await el.getAttribute("required") !== null) {
+            unknown.push({ question: label.slice(0, 200), type: "text" });
+          }
+        } catch { /* one bad field must not end the application */ }
+      }
+
+      // submit if we can, otherwise advance
+      const submit = await page.$(
+        'button:has-text("Submit"), button:has-text("Submit Application"), ' +
+        'input[type=submit], button:has-text("Send Application")');
+      if (submit) break;
+
+      const next = await page.$('button:has-text("Next"), button:has-text("Continue")');
+      if (next) { await next.click().catch(() => {}); await page.waitForTimeout(2500); continue; }
+      break;
+    }
+
+    if (unknown.length) await recordUnknowns(unknown);
+
+    const submit = await page.$(
+      'button:has-text("Submit"), button:has-text("Submit Application"), ' +
+      'input[type=submit], button:has-text("Send Application")');
+
+    if (!submit) {
+      return { status: "needs_help", help_reason: "error",
+               note: `No submit button found after filling ${filled} fields.` };
+    }
+
+    if (DRY_RUN) {
+      return { status: "needs_help", help_reason: "dry_run",
+               note: `Dry run: filled ${filled} fields, did not submit.` };
+    }
+
+    await submit.click({ timeout: 10000 });
+    await page.waitForTimeout(5000);
+
+    const after = (await page.innerText("body").catch(() => "")).toLowerCase();
+    const ok = /thank you|application (has been )?(received|submitted|sent)|we('ve| have) received|successfully (applied|submitted)|thanks for applying/.test(after);
+
+    if (ok) return { status: "applied", filled };
+
+    const errors = await page.$$eval('[role=alert], .error, .field-error',
+      (els) => els.map((e) => e.innerText.trim()).filter((t) => t && t.length < 200).slice(0, 5),
+    ).catch(() => []);
+
+    if (errors.length) {
+      return { status: "needs_help", help_reason: "error", note: errors.join(" | ").slice(0, 300) };
+    }
+    return { status: "applied", filled, note: "submitted, no confirmation text seen" };
+  } finally {
+    await page.close().catch(() => {});
+  }
+}
+
+async function recordUnknowns(unknowns) {
+  for (const u of unknowns.slice(0, 12)) {
+    const key = String(u.question).toLowerCase()
+      .replace(/[^\w\s]/g, " ").replace(/\s+/g, " ").trim().slice(0, 200);
+    if (key.length < 4) continue;
+    await db("answers", {
+      method: "POST",
+      headers: { Prefer: "resolution=ignore-duplicates,return=minimal" },
+      body: JSON.stringify([{
+        q_key: key, question: String(u.question).slice(0, 300),
+        answer: "", field_type: u.type ?? "text", confirmed: false,
+      }]),
+    }).catch(() => {});
+  }
+}
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+(async () => {
+  const [profileRow] = await db("profile?id=eq.1&select=*");
+  if (!profileRow?.email || !profileRow?.full_name) {
+    console.error("Profile incomplete — set your name and email in the panel.");
+    process.exit(1);
+  }
+
+  const p = { ...profileRow };
+  const names = (p.full_name || "").trim().split(/\s+/);
+  p.first_name = names[0] || "";
+  p.last_name = names.length > 1 ? names[names.length - 1] : "";
+
+  const answers = await db("answers?confirmed=eq.true&select=q_key,answer") ?? [];
+
+  const [run] = await db("runs", {
+    method: "POST", headers: { Prefer: "return=representation" },
+    body: JSON.stringify([{ kind: "apply" }]),
+  });
+
+  await heartbeat({ online: true, state: "applying" });
+
+  const browser = await chromium.launch({
+    args: ["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+  });
+  const context = await browser.newContext({
+    userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
+               "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    viewport: { width: 1440, height: 900 },
+    locale: "en-US",
+  });
+
+  const tally = { applied: 0, needs_help: 0, skipped: 0, errors: 0 };
+
+  try {
+    for (let i = 0; i < MAX_JOBS; i++) {
+      const claimed = await rpc("claim_next_job");
+      const job = Array.isArray(claimed) ? claimed[0] : claimed;
+      if (!job) { console.log("Queue empty."); break; }
+
+      console.log(`[${i + 1}] ${job.title} @ ${job.company ?? "?"}`);
+      await heartbeat({ online: true, state: "applying", current_job: job.id });
+
+      let outcome;
+      try {
+        outcome = await applyToJob(context, job, p, answers);
+      } catch (e) {
+        outcome = { status: "needs_help", help_reason: "error",
+                    note: String(e?.message ?? e).slice(0, 300) };
+        tally.errors++;
+      }
+
+      const patch = { status: outcome.status };
+      if (outcome.status === "applied") {
+        patch.applied_at = new Date().toISOString();
+        patch.confirm_state = "pending";
+      }
+      if (outcome.help_reason) patch.help_reason = outcome.help_reason;
+      if (outcome.skip_reason) patch.skip_reason = outcome.skip_reason;
+      if (outcome.note) patch.last_error = outcome.note;
+      await patchJob(job.id, patch);
+
+      tally[outcome.status] = (tally[outcome.status] ?? 0) + 1;
+      console.log(`    -> ${outcome.status}${outcome.note ? ": " + outcome.note : ""}`);
+
+      await new Promise((r) => setTimeout(r, 3000 + Math.random() * 4000));
+    }
+  } finally {
+    await browser.close().catch(() => {});
+    // The cloud agent runs in bursts rather than continuously, so it reports
+    // offline on exit. The panel's "last run" line is the honest signal.
+    await heartbeat({ online: false, state: "idle", current_job: null });
+    const message =
+      `applied ${tally.applied}, need you ${tally.needs_help ?? 0}, skipped ${tally.skipped ?? 0}`;
+    await db(`runs?id=eq.${run.id}`, {
+      method: "PATCH", headers: { Prefer: "return=minimal" },
+      body: JSON.stringify({
+        status: "done", processed: tally.applied, errors: tally.errors,
+        detail: tally, message, ended_at: new Date().toISOString(),
+      }),
+    }).catch(() => {});
+    console.log(message);
+  }
+})();
+```
+
+--------------------------------------------------------------------------------
+  3b. Path:  .github/workflows/apply.yml
+--------------------------------------------------------------------------------
+
+```yaml
+
+name: apply
+
+# Triggered three ways:
+#   1. From the panel (a button calls the GitHub API) — repository_dispatch
+#   2. On a schedule — every 3 hours
+#   3. By hand from the Actions tab — workflow_dispatch
+#
+# Public repositories get unlimited free runner minutes. Nothing personal
+# lives in this repo: the resume and profile are pulled from Supabase at
+# runtime using a secret, so it is safe to keep public.
+
+on:
+  repository_dispatch:
+    types: [apply]
+  workflow_dispatch:
+    inputs:
+      max_jobs:
+        description: "How many applications to attempt"
+        required: false
+        default: "25"
+      dry_run:
+        description: "Fill forms but never submit"
+        type: boolean
+        required: false
+        default: false
+  schedule:
+    - cron: "0 */3 * * *"
+
+# Never let two runs apply to the same queue at once.
+concurrency:
+  group: applypilot-apply
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Playwright + Chromium
+        run: |
+          npm install playwright@1.49.0
+          npx playwright install --with-deps chromium
+
+      - name: Apply
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          MAX_JOBS: ${{ github.event.inputs.max_jobs || github.event.client_payload.max_jobs || '25' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || github.event.client_payload.dry_run || 'false' }}
+        run: node apply.mjs
+```
+
+
+================================================================================
+  PART 4 — THE PANEL
+================================================================================
+
+DESIGN: TERMINAL
+
+The whole app looks like a terminal. No rounded cards, no gradients, no
+marketing polish, no emoji.
+
+  Background      #0b0f14
+  Panel           #121820
+  Border          #1b2733   1px, square (border-radius 2px maximum)
+  Text            #d7e0ea
+  Dim text        #5b6b7d
+  Green / accent  #10b981
+  Amber / warn    #f59e0b
+  Red / error     #ef4444
+  Cyan            #22d3ee
+
+  Font: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace — everywhere,
+  including headings, numbers and buttons.
+
+  Section headers are lowercase in brackets:   [ pipeline ]
+  Buttons are uppercase with letter-spacing:   RUN DISCOVERY
+  Status uses a leading dot:                   ● online   ○ offline
+  Tables are dense: 28px rows, 1px borders, no zebra striping, no shadows.
+
+  Mobile-first. Everything must work one-handed on a phone. Left sidebar on
+  desktop (fixed 180px), bottom tab bar on mobile. Nav items lowercase:
+  dashboard, jobs, review, answers, inbox, settings.
+
+AUTH
+
+  Supabase email+password only. No signup form, no social login, no landing
+  page. Unauthenticated users see a centered login box styled as a terminal
+  prompt. After login, go straight to the dashboard.
+
+EVERY BUTTON MUST DO SOMETHING REAL
+
+  RUN DISCOVERY  ->  supabase.functions.invoke('discover')
+  RUN SCORING    ->  supabase.functions.invoke('score')
+  RUN APPLY      ->  supabase.functions.invoke('run-apply',
+                       { body: { max_jobs: 25, dry_run: <checkbox> } })
+
+  For every invoke: disable the button with an inline spinner while it runs,
+  allow up to 180 seconds (these take 20-90s), then print the returned
+  `message` as a green log line or the `error` as a red one that stays until
+  dismissed. Never fail silently. Never show a generic error.
+
+  All other actions are plain table writes with optimistic update and rollback
+  on error.
+
+--------------------------------------------------------------------------------
+  PAGE: DASHBOARD
+--------------------------------------------------------------------------------
+
+Top status line, shell-prompt style, with two indicators:
+
+  agent   derived as described below
+  queue   count of jobs where status='queued'
+
+AGENT STATUS — get this logic right, it is the difference between the system
+looking broken and looking fine. Both appliers write to the `agent` table. The
+cloud agent sets version='cloud-agent'; the Chrome extension sets a version
+number like '1.0.0'. Evaluate in this order:
+
+  a) agent.online = true AND agent.version = 'cloud-agent'
+       show   ● cloud agent applying          no banner
+
+  b) agent.online = true  (the extension)
+       show   ● extension applying            no banner
+
+  c) otherwise look at the newest `runs` row where kind='apply':
+       - finished within the last 6 hours:
+           show   ○ agent idle - last run {relative}: {message}
+           NO BANNER. The cloud agent runs in bursts on a schedule, so idle
+           is its normal resting state, not a problem.
+       - older than 6 hours, or no such row:
+           show   ○ agent never run
+           and an amber banner: "No applications submitted yet. Press RUN
+           APPLY, or wait for the scheduled run."
+
+SETUP BLOCKER BANNER — when engine_status-style problems exist, i.e. the
+profile has no resume_text or search_config has no titles, show an amber panel
+titled "setup incomplete" listing exactly what is missing and which settings
+section fixes it.
+
+[ pipeline ] — counts from the v_stats view, each clickable to filter Jobs:
+  new  review  queued  applied  need_you  interview  offer  rejected
+
+[ today ] — three large numbers: applied_today, interviews, offers.
+
+[ actions ] — three buttons in a row: RUN DISCOVERY, RUN SCORING, RUN APPLY.
+  Beside RUN APPLY, a small checkbox labelled `dry run`, default UNCHECKED.
+  When checked show dim text: "fills real forms and stops before submitting.
+  use this the first time."
+  Caption under the row: "discovery finds jobs. scoring rates them and tailors
+  your resume. apply submits them — the applier runs on github, so your
+  computer can be off."
+
+[ needs you ] — jobs where status='needs_help'. Each row: title, company, a
+  colored tag for help_reason (captcha / login / resume_upload /
+  unknown_question / dry_run / error), the last_error text, an OPEN button
+  (opens apply_url in a new tab) and a DONE button (sets status back to
+  'queued' so the applier retries it).
+
+[ log ] — last 10 rows of `runs`, newest first, as terminal output:
+
+    14:32:07  discover  done   42 new jobs from 6 sources
+    14:28:51  score     done   scored 60, tailored 8
+    14:20:03  apply     done   applied 12, need you 3, skipped 1
+
+  Color the status word: done=green, error=red, running=amber. For kind='apply'
+  rows, append the `detail` jsonb inline as dim text. Subscribe to `runs` via
+  Realtime so lines appear live.
+
+--------------------------------------------------------------------------------
+  PAGE: JOBS
+--------------------------------------------------------------------------------
+
+Dense table, not cards: score | title | company | location | status | age
+
+  - score is a 2-char colored cell: 8-10 green, 6-7 cyan, 4-5 amber, <=3 dim
+  - status is a lowercase tag
+  - age is relative ("2h", "3d")
+  - on anything applied or later, a confirmation dot: green filled =
+    confirm_state 'confirmed' (tooltip "employer acknowledged — submission
+    verified"), gray hollow = 'pending', amber outline = 'unconfirmed'
+    (tooltip "no reply after 48h — this may not have gone through")
+
+Clicking a row expands it inline (accordion, not a modal): the description in
+a scrollable monospace block, score_reason, salary, the tailored_resume if
+present, and buttons:
+  QUEUE (status -> 'queued')   SKIP (-> 'skipped')   OPEN (apply_url)
+  BLOCK (append company to search_config.exclude_companies, set skipped)
+
+Filter bar: text search on title/company, status chips, minimum-score input.
+Filters apply to the query, not just the visible page. Paginate 50 at a time.
+Realtime on jobs.
+
+--------------------------------------------------------------------------------
+  PAGE: REVIEW
+--------------------------------------------------------------------------------
+
+Jobs with status='review', one at a time, full width: title, company, location,
+salary, score with reason, first 40 lines of the description with expand.
+
+Two large buttons: QUEUE IT (-> 'queued') and PASS (-> 'skipped'). Left/right
+arrow keys and swipe. Show "n remaining". Empty: "nothing to review."
+
+--------------------------------------------------------------------------------
+  PAGE: ANSWERS
+--------------------------------------------------------------------------------
+
+The screening-question memory, over `answers`. Two tabs:
+
+  [ needs answer ]  confirmed=false. Question text, an editable answer input
+    (dropdown when field_type='select'), SAVE sets the answer and
+    confirmed=true. Count badge in the nav.
+
+  [ saved ]  confirmed=true. Question, inline-editable answer, times_used,
+    last_used. Searchable. Delete with confirm.
+
+Header, dim: "the applier answers from this list first. anything it could not
+answer lands here — fill it once and it is used forever."
+
+--------------------------------------------------------------------------------
+  PAGE: INBOX
+--------------------------------------------------------------------------------
+
+Over `emails`, newest first. Filter chips with unread counts: action_needed,
+interview, offer, rejection, confirmation, other. Pin action_needed and
+interview to the top.
+
+Row: 1-char colored block, from_addr, subject, relative time, and the linked
+job's company when job_id is set. Click expands the body inline and sets
+is_read=true. Empty: "no job email yet."
+
+--------------------------------------------------------------------------------
+  PAGE: SETTINGS
+--------------------------------------------------------------------------------
+
+Four collapsible blocks, each with its own SAVE button.
+
+[ profile ] — the single `profile` row where id=1:
+  full_name, preferred_name, email, phone
+  address, city, state, postal_code, country
+  linkedin_url, github_url, portfolio_url
+  target_role, years_experience, education_level
+  salary_expectation (number), earliest_start
+
+  Then these as DROPDOWNS, never checkboxes, stored as TEXT:
+    work_authorized       Yes / No
+    needs_sponsorship     No / Yes
+    over_18               Yes / No
+    can_background_check  Yes / No
+    willing_to_relocate   No / Yes
+    veteran_status        "I am not a protected veteran" /
+                          "I am a protected veteran" / "I do not wish to answer"
+    disability_status     "I do not wish to answer" / "Yes" / "No"
+    gender                "Decline to self-identify" / "Male" / "Female" /
+                          "Non-binary"
+    race_ethnicity        "Decline to self-identify" plus standard US EEO
+                          categories
+
+  These strings are typed verbatim onto legal application forms. Never store a
+  boolean for them — "true" is not an answer to "are you authorized to work?"
+
+[ resume ] — a monospace textarea bound to profile.resume_text, 20 rows, with
+  a live word count. Also accept a dropped .txt file, read client-side into the
+  textarea. Dim note: "this exact text is what gets rewritten for each job."
+  If empty, show amber: "no resume — scoring and tailoring will not run."
+
+[ search ] — the single `search_config` row where id=1:
+  titles            tag input    "job titles to search"
+  locations         tag input
+  remote_ok         toggle
+  salary_floor      number
+  exclude_titles    tag input
+  exclude_companies tag input
+  no_go_patterns    tag input, prefilled from the column default
+  auto_apply_score  slider 1-10  "auto-apply at or above"
+  review_score      slider 1-10  "send to review at or above"
+  daily_cap         number
+  sources           checkbox group: greenhouse, lever, ashby, remotive,
+                    remoteok, arbeitnow, workable, usajobs
+
+  Require at least one title and one location. Amber warning when titles is
+  empty: "without job titles, discovery returns thousands of irrelevant
+  postings."
+
+[ companies ] — table over `companies`: name, ats (select: greenhouse / lever /
+  ashby / workable), token, enabled toggle, last_pulled, job_count. Add and
+  delete inline. Dim note: "the company's slug in its job board url.
+  job-boards.greenhouse.io/stripe means the token is 'stripe'. these feeds are
+  free, need no key, and link straight to the employer's own form."
+
+--------------------------------------------------------------------------------
+  POLISH
+--------------------------------------------------------------------------------
+
+Every page: a loading state that reads as a blinking terminal cursor, a
+designed empty state in dim monospace, and an error state showing the real
+error text.
+
+Realtime on jobs, runs, agent and emails, re-subscribing after network loss.
+
+Security: only the anon key in the client bundle. No service_role key, no
+GitHub token, no Gemini key in frontend code — all three are Edge Function
+secrets. No route renders data before the auth check resolves.
+
+
+================================================================================
+  PART 5 — SECRETS TO ASK THE USER FOR
+================================================================================
+
+Prompt for each of these and store it as an Edge Function secret. Never write
+any of them into frontend code.
+
+  GEMINI_API_KEY   free at aistudio.google.com/apikey. No credit card.
+                   Tell the user: never click "Enable billing" on that Google
+                   account — it deletes the free tier rather than extending it.
+
+  GITHUB_TOKEN     a GitHub fine-grained token with Actions: Read and write on
+                   this repository. github.com/settings/tokens
+
+  GITHUB_REPO      owner/name of this repository, e.g. succincc/project-apply
+
+The applier workflow also needs two REPOSITORY secrets, which the user adds in
+GitHub under Settings -> Secrets and variables -> Actions. Tell them to add
+these, with these exact names:
+
+  SUPABASE_URL            the project URL
+  SUPABASE_SERVICE_KEY    the service_role key
+
+The service_role key belongs only in GitHub repository secrets and in Supabase
+Edge Function secrets. It must never appear in the panel.
+
+
+================================================================================
+  WHEN YOU ARE DONE
+================================================================================
+
+Report plainly, in this order:
+  1. Did the migration succeed?
+  2. Which Edge Functions deployed, and which failed?
+  3. Were apply.mjs and .github/workflows/apply.yml committed?
+  4. Which secrets are still missing?
+
+Then tell the user the first three things to do, in this order:
+  1. Settings -> profile, and paste a resume under Settings -> resume
+  2. Settings -> search, add job titles and locations
+  3. Dashboard -> RUN DISCOVERY, then RUN SCORING, then RUN APPLY with
+     `dry run` ticked
+
+Expect RUN DISCOVERY to report 0 jobs until job titles are set. That message is
+the system working, not failing.
