@@ -1,0 +1,105 @@
+================================================================================
+  SEND TO LOVABLE — adds the cloud agent to your panel
+  Copy everything between  >>> BEGIN  and  >>> END  as ONE message.
+  Attach the file  edge-function-run-apply.txt  with it.
+================================================================================
+
+NOTE: apply.mjs and apply.yml do NOT go to Lovable. They go in a separate
+GitHub repository (see 04-CLOUD-AGENT.txt). Lovable only needs the trigger
+function below and the UI changes.
+
+>>> BEGIN
+
+Three changes. The applier now runs on GitHub Actions in the cloud instead of
+only in a Chrome extension, so the panel needs a way to start it and an
+honest way to show its status.
+
+1. NEW EDGE FUNCTION
+
+Deploy the attached file as a Supabase Edge Function named exactly
+`run-apply`. It needs two secrets — prompt me for both and store them as Edge
+Function secrets, never in the frontend bundle:
+
+    GITHUB_TOKEN   a GitHub fine-grained token with Actions: Read and write
+    GITHUB_REPO    owner/name, e.g. succincc/applypilot-agent
+
+The function returns `{ ok, message }` on success and `{ ok: false, error }`
+on failure. Display whichever is present verbatim — the error text names the
+exact cause and fix, so never replace it with a generic message.
+
+2. DASHBOARD: A THIRD ACTION BUTTON
+
+The [ actions ] row currently has RUN DISCOVERY and RUN SCORING. Add a third,
+styled identically:
+
+    RUN APPLY   ->  await supabase.functions.invoke('run-apply',
+                      { body: { max_jobs: 25, dry_run: false } })
+
+Next to it put a small checkbox labelled `dry run`, default UNCHECKED, whose
+value is passed as `dry_run`. When it is checked, show this dim line beneath:
+"fills real forms and stops before submitting. use this the first time."
+
+Update the caption under the actions row to:
+"discovery finds jobs. scoring rates them and tailors your resume. apply
+submits them — the cloud agent runs on github, so your computer can be off."
+
+3. DASHBOARD: FIX THE AGENT STATUS LINE
+
+This is the important part. Right now the status line reads the `agent` table,
+which only the Chrome extension writes, so it says "offline" even while the
+cloud agent is applying — which looks exactly like the system being broken.
+
+Both appliers now write to the `agent` table. Distinguish them by the
+`version` column: the cloud agent writes the literal string `cloud-agent`,
+and the extension writes a version number like `1.0.0`.
+
+Replace the status line and banner with this logic, in order:
+
+  a) If `agent.online` is true AND `agent.version` = 'cloud-agent':
+       show  ● cloud agent applying
+       no warning banner.
+
+  b) Else if `agent.online` is true (the extension):
+       show  ● extension applying
+       no warning banner.
+
+  c) Else look at the most recent row in `runs` where kind = 'apply':
+       - If one exists and finished within the last 6 hours:
+           show  ○ agent idle - last run {relative time}: {message}
+           no warning banner. This is the normal resting state for the cloud
+           agent, which runs in bursts on a schedule rather than continuously.
+       - If one exists but is older than 6 hours, or none exists:
+           show  ○ agent never run
+           and show the amber banner:
+           "No applications have been submitted yet. Press RUN APPLY, or set
+            up the cloud agent so it runs on a schedule."
+
+The old banner text about installing the Chrome extension should be removed —
+the extension is now optional, not required.
+
+4. ALSO ADD A [ runs ] DETAIL
+
+In the existing [ log ] section, make rows where kind = 'apply' show their
+`detail` jsonb inline when present, as dim text after the message, for
+example:  "applied 12, need you 3, skipped 1".
+
+Everything else stays as it is.
+
+>>> END
+
+================================================================================
+  AFTER LOVABLE IS DONE
+================================================================================
+
+The RUN APPLY button will return an error until you have:
+
+  1. Created the GitHub repo with apply.mjs and apply.yml   (04-CLOUD-AGENT.txt)
+  2. Added SUPABASE_URL + SUPABASE_SERVICE_KEY as repo secrets
+  3. Given Lovable the GITHUB_TOKEN and GITHUB_REPO secrets
+
+The error message tells you which one is missing. That is deliberate — a
+button that silently does nothing is what we are trying to get away from.
+
+First real press: tick `dry run`. It fills actual forms on actual postings and
+stops before submitting, so you can read the GitHub log and confirm it filled
+a sensible number of fields before anything is sent.

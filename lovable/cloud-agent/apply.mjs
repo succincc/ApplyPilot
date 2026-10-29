@@ -57,6 +57,22 @@ const patchJob = (id, patch) =>
     body: JSON.stringify({ ...patch, updated_at: new Date().toISOString() }),
   });
 
+/** Report status so the panel can show the cloud agent as alive.
+ *
+ * Without this the dashboard reads the `agent` table — written only by the
+ * Chrome extension — and shows "offline" the whole time the cloud agent is
+ * working, which looks exactly like the system being broken. */
+const heartbeat = (patch) =>
+  db("agent?id=eq.1", {
+    method: "PATCH",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify({
+      last_seen: new Date().toISOString(),
+      version: "cloud-agent",
+      ...patch,
+    }),
+  }).catch(() => {});
+
 // ---------------------------------------------------------------------------
 // Field matching — shared logic with the extension.
 //
@@ -373,6 +389,8 @@ async function recordUnknowns(unknowns) {
     body: JSON.stringify([{ kind: "apply" }]),
   });
 
+  await heartbeat({ online: true, state: "applying" });
+
   const browser = await chromium.launch({
     args: ["--disable-blink-features=AutomationControlled", "--no-sandbox"],
   });
@@ -392,6 +410,7 @@ async function recordUnknowns(unknowns) {
       if (!job) { console.log("Queue empty."); break; }
 
       console.log(`[${i + 1}] ${job.title} @ ${job.company ?? "?"}`);
+      await heartbeat({ online: true, state: "applying", current_job: job.id });
 
       let outcome;
       try {
@@ -419,6 +438,9 @@ async function recordUnknowns(unknowns) {
     }
   } finally {
     await browser.close().catch(() => {});
+    // The cloud agent runs in bursts rather than continuously, so it reports
+    // offline on exit. The panel's "last run" line is the honest signal.
+    await heartbeat({ online: false, state: "idle", current_job: null });
     const message =
       `applied ${tally.applied}, need you ${tally.needs_help ?? 0}, skipped ${tally.skipped ?? 0}`;
     await db(`runs?id=eq.${run.id}`, {
