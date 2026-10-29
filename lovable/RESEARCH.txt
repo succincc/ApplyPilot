@@ -1,0 +1,283 @@
+================================================================================
+  RESEARCH FINDINGS — mobile-only, email, AI calling, calendar
+  Researched 29 Oct 2026. Sources at the bottom.
+================================================================================
+
+Four asks. One is solved and built. One needs a $3/year domain. One I am not
+going to build, and the reason is not squeamishness. One is easy but small.
+
+--------------------------------------------------------------------------------
+1. EVERYTHING IN ONE PLACE, MOBILE ONLY  —  SOLVED, BUILT
+--------------------------------------------------------------------------------
+
+The blocker was the Chrome extension: Chrome on Android/iOS does not support
+extensions, so "mobile only" and "the extension applies" could not both be
+true.
+
+The fix is a cloud browser. GitHub Actions runs Playwright — a real Chromium —
+on their machines, free:
+
+    public repositories    unlimited runner minutes
+    private repositories   2,000 minutes/month  (~1,000 applications)
+
+At roughly 1.5-2 minutes per application, a PUBLIC repo gives you unlimited
+applications at zero cost. And nothing personal needs to live in that repo:
+the resume, profile and queue are all pulled from Supabase at runtime using a
+secret. The repo holds only the automation code, so public is safe.
+
+  BUILT:  cloud-agent/apply.mjs
+          cloud-agent/.github/workflows/apply.yml
+
+  Triggers three ways: a button in your panel (repository_dispatch), every 3
+  hours on a schedule, or by hand from the Actions tab.
+
+  ONE THING THE CLOUD AGENT DOES THAT THE EXTENSION CANNOT: upload your
+  resume file. A browser extension cannot set a file input — only a real
+  human click can, by browser security rule. Playwright can. So the cloud
+  agent clears the single biggest category of "needs you" jobs.
+
+  THE HONEST TRADE-OFF: GitHub's runners are datacenter IPs with no login
+  history. Your own Chrome has your real IP and your existing sessions. For
+  Greenhouse, Lever, Ashby and Workable — which is where your volume is, and
+  which are plain public forms — datacenter IPs are fine. For Workday portals
+  that want an account, the extension still wins.
+
+  RECOMMENDATION: run the cloud agent as the default. Keep the extension
+  installed on a desktop if you have one, for the stubborn sites. They share
+  the same queue and the same claim function, so they cannot collide.
+
+--------------------------------------------------------------------------------
+2. EMAIL  —  POSSIBLE, NEEDS A ~$3/YEAR DOMAIN
+--------------------------------------------------------------------------------
+
+You described what Sorce and similar do: apply from a dedicated address, have
+replies auto-sorted into interview/rejection/offer. That is exactly right, and
+here is how it is actually done.
+
+THE PROBLEM WITH USING YOUR PERSONAL GMAIL DIRECTLY
+
+  For the app to read your Gmail it needs the Gmail API with a restricted
+  OAuth scope. Google requires app verification for that, which takes 2-4
+  weeks and can require a security assessment. In unverified "testing" mode
+  it works, but the token expires every 7 days — you would be reconnecting
+  constantly. That is why none of the competitors do it this way.
+
+WHAT THEY ACTUALLY DO, AND WHAT YOU SHOULD DO
+
+  Buy one cheap domain (a .xyz is $1-3/year) and route mail through
+  Cloudflare, which is free:
+
+    Cloudflare Email Routing   free, ~200 addresses, unlimited receiving
+    Cloudflare Email Workers   free, runs code on each arriving email
+
+  Flow:
+
+    employer replies to  apply@yourdomain.xyz
+             |
+             +--> forwarded to thomasdeluca0727@gmail.com   (you see everything)
+             |
+             +--> Email Worker parses it, classifies it with Gemini, and
+                  writes it into the emails table            (app sees everything)
+
+  No OAuth. No 7-day tokens. No verification wait. Fully autonomous.
+
+ON PUTTING YOUR PERSONAL ADDRESS ON APPLICATIONS
+
+  You said you want your personal email on the application so employers
+  reach you directly. I would push back on exactly one point: use the custom
+  address instead, forwarded to your personal inbox.
+
+  You still receive every email in your normal Gmail — the forwarding is
+  invisible to you. But the app can also see them, which is the entire
+  point. And thomas@tdeluca.xyz reads more professionally on an application
+  than thomasdeluca0727@gmail.com.
+
+  If you insist on the personal address on applications, the receiving half
+  of this stops working and the Inbox screen stays empty.
+
+OUTBOUND: EMAILING EVERY EMPLOYER AFTER APPLYING
+
+  Sending is free up to a point:
+
+    Resend free tier    3,000 emails/month BUT capped at 100/day
+    Cloudflare Sending  needs Workers Paid, $5/month
+
+  100/day matches roughly 100 applications/day, so Resend free fits.
+
+  THE REAL PROBLEM IS NOT SENDING — IT IS WHO TO SEND TO.
+
+  Greenhouse, Lever and Ashby postings almost never include a human contact
+  address. The options for finding one are all bad:
+
+    guessing firstname@company.com    bounces wreck your sender reputation
+    scraping LinkedIn for recruiters  violates their terms, gets you banned
+    generic careers@ / jobs@          auto-filed, nobody reads it
+
+  Send a few hundred guessed emails and two things happen: most bounce, and
+  your domain gets flagged as a spam source — at which point even your real
+  replies start landing in junk. That actively damages the thing you are
+  trying to build.
+
+  THE VERSION THAT WORKS, and which I would build:
+
+    a) FOLLOW-UP ON SILENCE. 7-14 days after applying with no reply, send one
+       short follow-up to the address that confirmed your application — the
+       one you KNOW is real because it emailed you first. Deliverable,
+       welcome, and genuinely moves applications forward.
+
+    b) INSTANT REPLY TO HUMANS. When a real person emails you (not a
+       no-reply), draft a strong reply within minutes referencing that
+       specific role and your relevant experience. Speed of reply is one of
+       the few things you control that measurably affects outcomes.
+
+    c) CONFIRMATION TRACKING. Every "we received your application" email
+       proves a submission actually landed — independent of what the agent
+       claims. A source whose applications never get confirmed is silently
+       failing, and only this catches it.
+
+  That is 80% of the value of your idea, with none of the deliverability
+  self-harm. Blind outbound to guessed addresses is the 20% that burns the
+  asset.
+
+--------------------------------------------------------------------------------
+3. AI PHONE CALLS  —  I AM NOT BUILDING THIS, AND HERE IS WHY
+--------------------------------------------------------------------------------
+
+You asked me to research it, so here is the research rather than a brush-off.
+
+IT IS NOT FREE, AND IT IS NOT CLOSE
+
+  Cheapest realistic all-in cost per minute, late 2026:
+
+    Vapi      $0.09 - 0.22/min   ($5 starter credit, then paid)
+    Retell    $0.07 - 0.31/min   ($10 credit)
+    Bland     $0.14/min          (Start plan)
+    Twilio    $0.014/min         carrier only, no AI
+
+  At 100 calls/day × 2 minutes = $20-45/day = $600-1,350/month. There is no
+  free tier, only small one-time credits. Voice cloning adds ElevenLabs on
+  top, whose free tier is ~10,000 characters/month — a few calls.
+
+  Your entire stack right now costs $0. This one line item would cost more
+  than every paid competitor you mentioned, combined.
+
+THE LEGAL PROBLEM IS THE BIGGER ONE
+
+  In February 2024 the FCC ruled (FCC 24-17) that AI-generated voices are
+  "artificial or prerecorded voices" under the TCPA. That ruling is still
+  the governing federal rule.
+
+  Consequences that apply directly to what you described:
+
+    - Calls using an artificial voice generally require prior express
+      consent from the person called. An employer whose number you got from
+      a job posting has given you no consent.
+    - Statutory damages run $500 per negligent violation and up to $1,500
+      per willful violation. Per call.
+    - A separate FCC proposal (FCC 24-84) would require disclosing AI use on
+      the call. It has not been finalized, so "I'll just disclose it" is not
+      yet a defined safe harbor.
+    - Cloning your own voice to make the AI sound like a live person is the
+      specific thing the ruling targets. Doing it at volume, to businesses
+      that never opted in, is the fact pattern regulators describe.
+
+  Burner numbers do not fix this. They make it worse: using rotating numbers
+  to place artificial-voice calls without consent is the pattern enforcement
+  actions are built around.
+
+  I am not going to build something that cold-calls hundreds of businesses in
+  a cloned version of your voice. The downside is not a warning email — it is
+  per-call statutory damages, and it is aimed at you, not at me.
+
+WHAT ACTUALLY WORKS, AND IS FREE AND LEGAL
+
+  Your original instinct was right — the thing that worked was YOU calling
+  and selling yourself. That worked because it was you. An AI reading a
+  script to a receptionist does not reproduce what made it work.
+
+  Two free substitutes that capture the real mechanism:
+
+    CALL LIST. For every application scoring 8+, the panel surfaces the
+    company's published phone number and a tailored 30-second script built
+    from that specific posting and your resume. You make 5 calls in 20
+    minutes to the jobs you actually want. Same pitch, same effect, zero
+    cost, zero legal exposure, and it is actually you — which is the part
+    that worked.
+
+    THE EMAIL EQUIVALENT. The follow-up and fast-reply system in section 2
+    is the scalable version of "reach out directly after applying." It gets
+    in front of a human, it is welcome, and it costs nothing.
+
+  If you still want the calls, the honest path is: do them yourself off the
+  generated list. I will build that list and those scripts.
+
+--------------------------------------------------------------------------------
+4. GOOGLE CALENDAR  —  EASY, SMALL
+--------------------------------------------------------------------------------
+
+  Two levels, and the free one covers most of it:
+
+  WITHOUT OAUTH (free, works today, no setup):
+    When an interview email is detected, generate a .ics file and an
+    "Add to Google Calendar" link. One tap on your phone adds it. The panel
+    shows an interview list with accept/decline buttons that send the reply
+    email.
+
+  WITH OAUTH (more setup, fully automatic):
+    Calendar scopes are NOT in the restricted tier that Gmail's are, so
+    verification is lighter. The app could read your availability, account
+    for travel time from your address, and propose slots.
+
+  THE HONEST LIMIT ON AUTO-BOOKING: most interview scheduling now happens
+  through a Calendly/Greenhouse scheduling link, not by proposing times over
+  email. Those links need a human to pick a slot. So "automatically book
+  interviews" mostly resolves to "surface the link instantly and let you tap
+  once" — which the interview-detection already does.
+
+--------------------------------------------------------------------------------
+RECOMMENDED ORDER
+--------------------------------------------------------------------------------
+
+  1. Deploy the cloud agent            DONE, needs 10 min of setup
+     -> applying becomes mobile-only and autonomous
+
+  2. Buy a .xyz domain (~$3/yr) + Cloudflare Email Routing
+     -> inbound classification works autonomously, no OAuth
+
+  3. Build follow-up + fast-reply email (Resend free)
+     -> the useful 80% of your outbound idea
+
+  4. Interview detection -> .ics + accept/decline
+     -> calendar without the OAuth project
+
+  5. Call list + tailored scripts
+     -> your phone idea, legal and free, with you on the line
+
+--------------------------------------------------------------------------------
+SOURCES
+--------------------------------------------------------------------------------
+
+  GitHub Actions free tier (2,000 min private / unlimited public)
+    https://www.macrostack.net/pricing/github-actions
+    https://cicdcalculator.com/github-actions-free-tier
+
+  Cloudflare Email Routing (free inbound, ~200 addresses, cannot send)
+    https://kocys.com/article/cloudflare-email-routing
+    https://markrelay.com/research/site.cloudflare.com-email-routing-free-send-email
+
+  Resend free tier (3,000/month, 100/day cap)
+    https://markrelay.com/research/site.resend.com-pricing-free-plan
+    https://nuntly.com/resend-pricing
+
+  Gmail API quotas and OAuth verification burden
+    https://www.unipile.com/gmail-api-limits/
+
+  AI voice agent pricing
+    https://stackbinary.io/insights/voice-ai-pricing-per-minute-2026
+    https://superdupr.com/blog/voice-ai-pricing
+
+  FCC ruling on AI voices under the TCPA (FCC 24-17, Feb 2024)
+    https://www.fcc.gov/document/fcc-makes-ai-generated-voices-robocalls-illegal
+    https://www.wiley.law/alert-FCC-Extends-Regulatory-Reach-Over-AI-Announces-TCPA-Restrictions-Cover-AI-Generated-Voices-in-Outbound-Calls
+
+  This is research, not legal advice.

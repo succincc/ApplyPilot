@@ -1,0 +1,167 @@
+================================================================================
+  CLOUD AGENT — makes applying work from your phone
+================================================================================
+
+This replaces the Chrome extension for everyday use. It runs a real browser on
+GitHub's servers, so applications get submitted whether or not any computer of
+yours is on. Setup is about 10 minutes and happens entirely in a browser — you
+can do all of it from your phone.
+
+Why this exists: Chrome on mobile cannot run extensions. GitHub Actions can run
+a real Chromium for free, so that is where the applier lives.
+
+Cost: free. Public repositories get unlimited GitHub Actions minutes. Nothing
+personal lives in the repo — your resume and profile are pulled from Supabase
+at runtime through a secret, so public is safe.
+
+--------------------------------------------------------------------------------
+STEP 1 — MAKE THE REPOSITORY  (3 min)
+--------------------------------------------------------------------------------
+
+  1. Go to github.com/new
+  2. Name it:  applypilot-agent
+  3. Choose PUBLIC.  (Public = unlimited free minutes. Private works too but
+     caps at 2,000 minutes/month, roughly 1,000 applications.)
+  4. Tick "Add a README file" so the repo is not empty.
+  5. Create repository.
+
+Now add the two files. On mobile, use the GitHub website:
+
+  6. Press "Add file" -> "Create new file"
+     Name it exactly:   apply.mjs
+     Paste the entire contents of  cloud-agent/apply.mjs
+     Commit.
+
+  7. Press "Add file" -> "Create new file"
+     Name it exactly:   .github/workflows/apply.yml
+     (typing the slashes creates the folders)
+     Paste the entire contents of  cloud-agent/.github/workflows/apply.yml
+     Commit.
+
+--------------------------------------------------------------------------------
+STEP 2 — ADD YOUR TWO SECRETS  (3 min)
+--------------------------------------------------------------------------------
+
+  In the repo: Settings -> Secrets and variables -> Actions -> New repository
+  secret. Add these two:
+
+     Name:   SUPABASE_URL
+     Value:  https://YOUR_PROJECT.supabase.co
+
+     Name:   SUPABASE_SERVICE_KEY
+     Value:  your service_role key
+
+  Both come from Supabase -> Settings -> API. In Lovable Cloud, look under the
+  backend/Cloud view for the same two values.
+
+  The service_role key belongs here and nowhere else in this system. GitHub
+  encrypts secrets and never prints them in logs. Do not put it in the panel
+  or the extension — those use the anon key.
+
+--------------------------------------------------------------------------------
+STEP 3 — TEST IT, SAFELY  (4 min)
+--------------------------------------------------------------------------------
+
+  Do a dry run first. It fills real forms on real postings and stops before
+  submitting anything.
+
+  1. In the repo, open the Actions tab.
+  2. Click the "apply" workflow on the left.
+  3. "Run workflow" -> set dry_run to TRUE, max_jobs to 3 -> Run.
+  4. Wait about 2 minutes, then open the run and read the log.
+
+  You should see lines like:
+
+     [1] Customer Success Manager @ Acme
+         -> needs_help: Dry run: filled 14 fields, did not submit.
+
+  Fourteen fields filled means the matching works. If you see "filled 0
+  fields", the profile in your panel is incomplete.
+
+  5. Check your panel. Those jobs now show in [ needs you ] with reason
+     dry_run. Press DONE on each to put them back in the queue.
+
+  6. When you are satisfied, run it again with dry_run FALSE.
+
+--------------------------------------------------------------------------------
+STEP 4 — LET IT RUN ON ITS OWN
+--------------------------------------------------------------------------------
+
+The workflow already includes a schedule: every 3 hours it wakes up, takes up
+to 25 jobs from the queue, and applies. You do not have to do anything.
+
+To change the pace, edit the cron line in apply.yml:
+
+    - cron: "0 */3 * * *"     every 3 hours   (default)
+    - cron: "0 */6 * * *"     every 6 hours
+    - cron: "0 9,15,21 * * *" three fixed times daily
+
+GitHub schedules can run a few minutes late under load. That is normal.
+
+--------------------------------------------------------------------------------
+OPTIONAL — A RUN BUTTON IN YOUR PANEL
+--------------------------------------------------------------------------------
+
+To trigger it from the panel instead of the Actions tab:
+
+  1. Make a GitHub fine-grained token: github.com/settings/tokens
+     Repository access: only applypilot-agent
+     Permission: Actions -> Read and write
+  2. Store it as a Supabase Edge Function secret named GITHUB_TOKEN, and your
+     username/repo as GITHUB_REPO (e.g. succincc/applypilot-agent).
+  3. Ask Lovable for a RUN APPLY button that calls an Edge Function which
+     POSTs to:
+
+       https://api.github.com/repos/OWNER/REPO/dispatches
+       headers: Authorization: Bearer <GITHUB_TOKEN>
+                Accept: application/vnd.github+json
+       body:    {"event_type":"apply","client_payload":{"max_jobs":25}}
+
+  Never put the GitHub token in the frontend — it goes in an Edge Function
+  secret, same as the Gemini key.
+
+--------------------------------------------------------------------------------
+CLOUD AGENT vs CHROME EXTENSION
+--------------------------------------------------------------------------------
+
+  Both read the same queue and use the same atomic claim function, so they can
+  never apply to the same job twice. Run either, or both.
+
+                            cloud agent        chrome extension
+  works from a phone        yes                no
+  runs with everything off  yes                no, Chrome must be open
+  uploads your resume file  yes                no (browser security rule)
+  your real IP + logins     no                 yes
+  Workday portals w/ login  weaker             stronger
+  cost                      free               free
+
+  Use the cloud agent as your default. If you have a desktop, keep the
+  extension for the stubborn sites.
+
+--------------------------------------------------------------------------------
+TROUBLESHOOTING
+--------------------------------------------------------------------------------
+
+  Workflow fails instantly
+    A secret is missing or misspelled. Check Settings -> Secrets. The names
+    must be exactly SUPABASE_URL and SUPABASE_SERVICE_KEY.
+
+  "Profile incomplete"
+    Set your name and email in the panel under Settings -> profile.
+
+  "Queue empty"
+    Nothing has status 'queued'. Run discovery, then scoring, in the panel.
+    Scoring is what moves good jobs into the queue.
+
+  Everything comes back "filled 0 fields"
+    The profile is empty, or the postings are login-walled. Open one of the
+    apply_urls by hand and see what the form actually looks like.
+
+  Lots of needs_help with captcha
+    Expected on some sites. Those jobs wait for you; open and finish them
+    from the dashboard. The cloud agent already removes the largest category
+    (resume uploads) that the extension could not handle.
+
+  Nothing runs on schedule
+    GitHub disables scheduled workflows on repos with no activity for 60
+    days. Push any commit to re-enable.

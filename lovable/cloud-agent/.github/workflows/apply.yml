@@ -1,0 +1,57 @@
+name: apply
+
+# Triggered three ways:
+#   1. From the panel (a button calls the GitHub API) — repository_dispatch
+#   2. On a schedule — every 3 hours
+#   3. By hand from the Actions tab — workflow_dispatch
+#
+# Public repositories get unlimited free runner minutes. Nothing personal
+# lives in this repo: the resume and profile are pulled from Supabase at
+# runtime using a secret, so it is safe to keep public.
+
+on:
+  repository_dispatch:
+    types: [apply]
+  workflow_dispatch:
+    inputs:
+      max_jobs:
+        description: "How many applications to attempt"
+        required: false
+        default: "25"
+      dry_run:
+        description: "Fill forms but never submit"
+        type: boolean
+        required: false
+        default: false
+  schedule:
+    - cron: "0 */3 * * *"
+
+# Never let two runs apply to the same queue at once.
+concurrency:
+  group: applypilot-apply
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Playwright + Chromium
+        run: |
+          npm install playwright@1.49.0
+          npx playwright install --with-deps chromium
+
+      - name: Apply
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          MAX_JOBS: ${{ github.event.inputs.max_jobs || github.event.client_payload.max_jobs || '25' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || github.event.client_payload.dry_run || 'false' }}
+        run: node apply.mjs
